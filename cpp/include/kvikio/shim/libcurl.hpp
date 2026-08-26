@@ -25,7 +25,8 @@ namespace kvikio {
 /**
  * @brief Singleton class to initialize and cleanup the global state of libcurl
  *
- * Notice, libcurl allows the use of a singleton class:
+ * Notice, libcurl allows the use of a singleton class. KvikIO keeps this singleton alive until
+ * process exit because the MULTI_POLL reactor pool has the same process lifetime:
  *
  * In a C++ module, it is common to deal with the global constant situation by defining a special
  * class that represents the global constant environment of the module. A program always has exactly
@@ -68,7 +69,7 @@ class LibCurl {
   /**
    * @brief Retain a curl handle for later use.
    */
-  void retain_handle(UniqueHandlePtr handle);
+  void retain_handle(UniqueHandlePtr handle) noexcept;
 };
 
 /**

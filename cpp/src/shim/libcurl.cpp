@@ -48,8 +48,11 @@ LibCurl::~LibCurl() noexcept
 
 LibCurl& LibCurl::instance()
 {
-  static LibCurl _instance;
-  return _instance;
+  // MultiReactorPool intentionally owns process-lifetime reactor threads and CURLM handles. Keep
+  // curl's global state alive for the same lifetime; running curl_global_cleanup from a normal
+  // function-static destructor while those threads are in curl_multi_poll() is undefined.
+  static LibCurl* instance = new LibCurl();
+  return *instance;
 }
 
 LibCurl::UniqueHandlePtr LibCurl::get_free_handle()
@@ -79,10 +82,15 @@ LibCurl::UniqueHandlePtr LibCurl::get_handle()
   return ret;
 }
 
-void LibCurl::retain_handle(UniqueHandlePtr handle)
+void LibCurl::retain_handle(UniqueHandlePtr handle) noexcept
 {
-  std::lock_guard const lock(_mutex);
-  _free_curl_handles.push_back(std::move(handle));
+  try {
+    std::lock_guard const lock(_mutex);
+    _free_curl_handles.push_back(std::move(handle));
+  } catch (...) {
+    // This function is called by CurlHandle's noexcept destructor. Under memory pressure, failing
+    // to grow the reuse cache must destroy the easy handle normally, not call std::terminate.
+  }
 }
 
 CurlHandle::CurlHandle(LibCurl::UniqueHandlePtr handle,

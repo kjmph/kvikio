@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <functional>
@@ -22,11 +23,14 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <kvikio/defaults.hpp>
+#include <kvikio/detail/io_event_barrier.hpp>
 #include <kvikio/hdfs.hpp>
 #include <kvikio/remote_handle.hpp>
 #include <kvikio/shim/libcurl.hpp>
 
 #include "utils/env.hpp"
+#include "utils/utils.hpp"
 
 using ::testing::HasSubstr;
 using ::testing::ThrowsMessage;
@@ -35,7 +39,7 @@ namespace {
 
 class OneRequestHttpServer {
  public:
-  OneRequestHttpServer()
+  explicit OneRequestHttpServer(std::string body = {}) : _body{std::move(body)}
   {
     _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (_listen_fd < 0) { throw std::runtime_error(std::strerror(errno)); }
@@ -113,8 +117,9 @@ class OneRequestHttpServer {
       _request.append(buffer, static_cast<std::size_t>(received));
     }
 
-    constexpr char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    std::ignore               = send_all(client, response, sizeof(response) - 1);
+    auto const response = std::string{"HTTP/1.1 200 OK\r\nContent-Length: "} +
+                          std::to_string(_body.size()) + "\r\nConnection: close\r\n\r\n" + _body;
+    std::ignore = send_all(client, response.data(), response.size());
     ::shutdown(client, SHUT_RDWR);
     ::close(client);
   }
@@ -123,6 +128,48 @@ class OneRequestHttpServer {
   uint16_t _port = 0;
   std::thread _thread;
   std::string _request;
+  std::string _body;
+};
+
+std::atomic<std::size_t> stream_synchronize_calls{};
+std::atomic<std::size_t> context_synchronize_calls{};
+decltype(kvikio::cudaAPI::instance().StreamSynchronize) saved_stream_synchronize{};
+decltype(kvikio::cudaAPI::instance().CtxSynchronize) saved_context_synchronize{};
+
+CUresult CUDAAPI fail_stream_synchronize(CUstream)
+{
+  ++stream_synchronize_calls;
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult CUDAAPI count_and_forward_context_synchronize()
+{
+  ++context_synchronize_calls;
+  return saved_context_synchronize();
+}
+
+class ScopedCudaCompletionFailure {
+ public:
+  ScopedCudaCompletionFailure()
+  {
+    auto& stream_slot         = kvikio::cudaAPI::instance().StreamSynchronize;
+    auto& context_slot        = kvikio::cudaAPI::instance().CtxSynchronize;
+    saved_stream_synchronize  = stream_slot;
+    saved_context_synchronize = context_slot;
+    stream_synchronize_calls  = 0;
+    context_synchronize_calls = 0;
+    stream_slot               = &fail_stream_synchronize;
+    context_slot              = &count_and_forward_context_synchronize;
+  }
+
+  ScopedCudaCompletionFailure(ScopedCudaCompletionFailure const&)            = delete;
+  ScopedCudaCompletionFailure& operator=(ScopedCudaCompletionFailure const&) = delete;
+
+  ~ScopedCudaCompletionFailure()
+  {
+    kvikio::cudaAPI::instance().StreamSynchronize = saved_stream_synchronize;
+    kvikio::cudaAPI::instance().CtxSynchronize    = saved_context_synchronize;
+  }
 };
 
 }  // namespace
@@ -145,6 +192,16 @@ class CountingEndpoint : public kvikio::RemoteEndpoint {
   std::size_t file_size{100};
   int setopt_calls{};
   int range_request_calls{};
+};
+
+class RestoreRemoteIoBackend {
+ public:
+  RestoreRemoteIoBackend() : _backend{kvikio::defaults::remote_io_backend()} {}
+
+  ~RestoreRemoteIoBackend() { kvikio::defaults::set_remote_io_backend(_backend); }
+
+ private:
+  kvikio::RemoteIOBackend _backend;
 };
 
 class RemoteHandleTest : public testing::Test {
@@ -312,6 +369,43 @@ TEST_F(RemoteHandleTest, read_overflowing_range_throws_without_range_request)
               ThrowsMessage<std::invalid_argument>(HasSubstr("cannot read ")));
   EXPECT_EQ(endpoint_ptr->setopt_calls, 0);
   EXPECT_EQ(endpoint_ptr->range_request_calls, 0);
+}
+
+TEST_F(RemoteHandleTest, device_read_failure_fences_context_before_rethrow)
+{
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  OneRequestHttpServer server{"x"};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), 1);
+  kvikio::test::DevBuffer<char> output(1);
+
+  {
+    ScopedCudaCompletionFailure const failure;
+    EXPECT_THROW(std::ignore = remote_handle.read(output.ptr, 1), kvikio::CUfileException);
+    EXPECT_EQ(stream_synchronize_calls.load(), 1);
+    EXPECT_EQ(context_synchronize_calls.load(), 1);
+  }
+}
+
+TEST_F(RemoteHandleTest, completion_future_failure_precedes_device_transfer_submission)
+{
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+
+  auto endpoint      = std::make_unique<CountingEndpoint>();
+  auto* endpoint_ptr = endpoint.get();
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), endpoint_ptr->file_size);
+  kvikio::test::DevBuffer<char> output(1);
+
+  kvikio::detail::inject_io_completion_future_failure_for_testing();
+  EXPECT_THROW(std::ignore = remote_handle.pread(output.ptr, 1, 0, 1), std::bad_alloc);
+
+  // Transfer construction occurred, but the completion wrapper failed before the reactor-pool
+  // handoff. No asynchronous work can retain the caller-owned destination.
+  EXPECT_EQ(endpoint_ptr->setopt_calls, 1);
+  EXPECT_EQ(endpoint_ptr->range_request_calls, 1);
 }
 
 TEST_F(RemoteHandleTest, test_s3_url)

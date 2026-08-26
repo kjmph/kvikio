@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <map>
@@ -35,6 +36,21 @@ namespace kvikio::detail {
  */
 [[nodiscard]] KVIKIO_EXPORT std::optional<std::size_t> bounce_buffer_cache_shard_limit(
   std::size_t max_total, std::size_t num_reactors);
+
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+/**
+ * @brief Failure points used to verify exceptional bounce-buffer recycle paths.
+ */
+enum class BounceBufferCacheFailurePoint { ACCOUNTING_TRANSITION, CALLBACK_INSERTION };
+
+/**
+ * @brief Make the next recycle operation throw at @p point.
+ *
+ * The hook is one-shot and compiled only into test builds.
+ */
+KVIKIO_EXPORT void inject_bounce_buffer_cache_failure_for_testing(
+  BounceBufferCacheFailurePoint point) noexcept;
+#endif
 
 /**
  * @brief Per-(thread, CUDA context) cache of bounce buffers with async recycling.
@@ -146,10 +162,10 @@ class BounceBufferCachePerThreadAndContext {
    * `cuMemcpyAsync` (or whatever CUDA work) that consumes `buf`, the buffer is returned to the free
    * list on a CUDA driver controlled thread. Non-blocking on the calling thread.
    *
-   * @note Edge case: When the cap is unlimited (`std::nullopt`), the free list can reallocate
-   * inside the callback. If that reallocation fails (host OOM) AND the bounce buffer size is
-   * changed at runtime, the buffer's destructor may call `cuMemFreeHost` on a CUDA driver thread,
-   * which violates the `cuLaunchHostFunc` contract. This is currently an unhandled edge case.
+   * @note If callback-side cache insertion fails (for example, an unlimited cache cannot grow its
+   * free list under host OOM), the callback detaches the allocation without invoking CUDA,
+   * poisons this cache, and fails closed. The allocation is intentionally leaked because CUDA APIs
+   * are forbidden from a `cuLaunchHostFunc` callback.
    *
    * @param ctx The CUDA context the buffer was acquired under (must match the original `try_get`
    * call).
@@ -165,12 +181,36 @@ class BounceBufferCachePerThreadAndContext {
                      CUstream stream,
                      std::function<void()> on_recycle = {});
 
+  /**
+   * @brief Quarantine a checked-out buffer after CUDA cannot establish a reuse fence.
+   *
+   * The allocation is intentionally leaked and the owning shard is poisoned. Its checked-out
+   * accounting remains charged so no replacement can hide the lost slot. This function is the
+   * terminal recovery path for a failed asynchronous operation followed by a failed stream
+   * synchronization.
+   *
+   * @param ctx The CUDA context under which the buffer was acquired.
+   * @param buf The uncertain DMA source. Ownership is consumed without freeing or recycling it.
+   */
+  void abandon_checked_out_after_failed_sync(CUcontext ctx, Buffer&& buf) noexcept;
+
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+  /**
+   * @brief Remove an isolated poisoned shard after a test has freed its deliberately leaked slot.
+   *
+   * This is test-only cleanup. Production code must never revive a shard after CUDA failed to
+   * establish safe buffer reuse.
+   */
+  void erase_poisoned_shard_for_testing(CUcontext ctx);
+#endif
+
  private:
   struct Shard {
     std::mutex mutex;
     std::vector<Buffer> free;
     std::size_t checked_out{0};
     std::size_t in_flight{0};
+    bool poisoned{false};
     // Invariant: !cap.has_value() || free.size() + checked_out + in_flight <= *cap
 
     explicit Shard(std::optional<std::size_t> cap);
@@ -179,6 +219,7 @@ class BounceBufferCachePerThreadAndContext {
   // Associates a buffer with the shard whose free list will receive it. Heap-allocated and passed
   // as user data to `cuLaunchHostFunc`. The callback deletes this struct after moving the buffer.
   struct RecycleCallbackData {
+    BounceBufferCachePerThreadAndContext* owner;
     Shard* shard;
     Buffer buffer;
     // Called after the buffer is returned to the free list.
@@ -195,6 +236,10 @@ class BounceBufferCachePerThreadAndContext {
   Shard& get_shard(CUcontext ctx);
 
   std::optional<std::size_t> _cap;
+  // Emergency cache-wide stop used when a no-throw quarantine path cannot safely make a buffer
+  // reusable. This includes callback-side cache insertion failure and inability to reach the
+  // shard that necessarily existed when a buffer was checked out.
+  std::atomic<bool> _emergency_poisoned{false};
   std::mutex _map_mutex;
   std::map<std::pair<std::thread::id, CUcontext>, std::unique_ptr<Shard>> _shards;
 };

@@ -227,6 +227,10 @@ target_compile_definitions(
   kvikio PRIVATE "KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${KVIKIO_LOGGING_LEVEL}"
 )
 
+if(KvikIO_BUILD_TESTS AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+  target_compile_definitions(kvikio PRIVATE KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+endif()
+
 # Notice, we do not link to cuda or cufile since KvikIO opens them manually using `dlopen()`.
 target_link_libraries(
   kvikio

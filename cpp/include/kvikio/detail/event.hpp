@@ -122,6 +122,15 @@ class CudaEventPool {
      * than `CUDA_SUCCESS` or `CUDA_ERROR_NOT_READY`.
      */
     [[nodiscard]] bool is_done() const;
+
+    /**
+     * @brief Permanently remove a failed event from the reuse pool without calling CUDA.
+     *
+     * Used only after an event record or wait fails. The opaque handle is intentionally leaked:
+     * returning a potentially poisoned event to another operation is unsafe, and issuing another
+     * CUDA API call while handling a driver failure is not reliable.
+     */
+    void abandon() noexcept;
   };
 
  private:

@@ -9,6 +9,7 @@
 
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
+#include <kvikio/detail/cuda_fence.hpp>
 #include <kvikio/detail/nvtx.hpp>
 #include <kvikio/detail/posix_io.hpp>
 #include <kvikio/error.hpp>
@@ -32,6 +33,9 @@ std::size_t posix_device_read_aligned(int fd_direct_off,
 
   // Get a stream for the current CUDA context and thread
   CUstream stream = StreamCachePerThreadAndContext::get();
+  CUcontext context{};
+  KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().CtxGetCurrent(&context));
+  KVIKIO_EXPECT(context != nullptr, "POSIX device read requires a current CUDA context");
 
   while (bytes_remaining > 0) {
     // Each iteration re-derives alignment from the current file offset rather than assuming the
@@ -56,12 +60,14 @@ std::size_t posix_device_read_aligned(int fd_direct_off,
 
     std::size_t nbytes_processed = std::min(nbytes_expected, nbytes_io - prefix);
 
-    KVIKIO_CUDA_DRIVER_TRY(cudaAPI::cuda_memcpy_async(
-      devPtr,
-      convert_void2deviceptr(static_cast<std::byte*>(bounce_buffer.get()) + prefix),
-      nbytes_processed,
-      stream));
-    KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+    run_with_context_fence_on_failure(context, [&] {
+      KVIKIO_CUDA_DRIVER_TRY(cudaAPI::cuda_memcpy_async(
+        devPtr,
+        convert_void2deviceptr(static_cast<std::byte*>(bounce_buffer.get()) + prefix),
+        nbytes_processed,
+        stream));
+      KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+    });
 
     cur_file_offset += nbytes_processed;
     devPtr += nbytes_processed;

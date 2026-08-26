@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <algorithm>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
-#include <tuple>
+#include <string>
 #include <utility>
 
 #include <kvikio/bounce_buffer.hpp>
@@ -20,6 +20,54 @@
 #include <kvikio/shim/cuda.hpp>
 
 namespace kvikio::detail {
+
+namespace {
+
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+constexpr int failure_injection_disabled = -1;
+std::atomic<int> recycle_failure_point{failure_injection_disabled};
+
+void maybe_inject_recycle_failure(BounceBufferCacheFailurePoint point)
+{
+  auto expected = static_cast<int>(point);
+  if (recycle_failure_point.compare_exchange_strong(expected,
+                                                    failure_injection_disabled,
+                                                    std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+    throw std::bad_alloc{};
+  }
+}
+#endif
+
+void log_failure_noexcept(char const* prefix, std::exception_ptr failure) noexcept
+{
+  try {
+    if (failure != nullptr) { std::rethrow_exception(failure); }
+    try {
+      KVIKIO_LOG_ERROR(std::string{prefix} + "unknown exception");
+    } catch (...) {
+    }
+  } catch (std::exception const& error) {
+    try {
+      KVIKIO_LOG_ERROR(std::string{prefix} + error.what());
+    } catch (...) {
+    }
+  } catch (...) {
+    try {
+      KVIKIO_LOG_ERROR(std::string{prefix} + "unknown exception");
+    } catch (...) {
+    }
+  }
+}
+
+}  // namespace
+
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+void inject_bounce_buffer_cache_failure_for_testing(BounceBufferCacheFailurePoint point) noexcept
+{
+  recycle_failure_point.store(static_cast<int>(point), std::memory_order_release);
+}
+#endif
 
 std::optional<std::size_t> bounce_buffer_cache_shard_limit(std::size_t max_total,
                                                            std::size_t num_reactors)
@@ -70,6 +118,9 @@ std::optional<typename BounceBufferCachePerThreadAndContext<Allocator>::Buffer>
 BounceBufferCachePerThreadAndContext<Allocator>::try_get(CUcontext ctx)
 {
   KVIKIO_NVTX_FUNC_RANGE();
+  KVIKIO_EXPECT(!_emergency_poisoned.load(std::memory_order_acquire),
+                "bounce-buffer cache is poisoned after CUDA could not establish safe buffer reuse",
+                std::runtime_error);
   auto& shard = get_shard(ctx);
 
   std::vector<Buffer> stale_buffers;
@@ -77,6 +128,11 @@ BounceBufferCachePerThreadAndContext<Allocator>::try_get(CUcontext ctx)
   bool cap_reached{false};
   {
     std::lock_guard const lock(shard.mutex);
+
+    KVIKIO_EXPECT(!shard.poisoned,
+                  "bounce-buffer cache is poisoned after CUDA could not establish safe buffer "
+                  "reuse",
+                  std::runtime_error);
 
     // Discard free buffers whose size no longer matches the current bounce_buffer_size. Their
     // destructors route through BounceBufferPool::put, which deallocates wrong-size buffers.
@@ -116,13 +172,54 @@ BounceBufferCachePerThreadAndContext<Allocator>::try_get(CUcontext ctx)
 }
 
 template <typename Allocator>
+void BounceBufferCachePerThreadAndContext<Allocator>::abandon_checked_out_after_failed_sync(
+  CUcontext ctx, Buffer&& buf) noexcept
+{
+  if (buf.get() == nullptr) { return; }
+  // Detach the allocation before any lock or logging operation can fail. CUDA could not prove that
+  // asynchronous readers stopped touching it, so its destructor must never run.
+  std::ignore = buf.release();
+  try {
+    auto& shard = get_shard(ctx);
+    std::lock_guard const lock(shard.mutex);
+    shard.poisoned = true;
+  } catch (...) {
+    auto const poison_error = std::current_exception();
+    _emergency_poisoned.store(true, std::memory_order_release);
+    log_failure_noexcept("failed to poison bounce-buffer cache shard: ", poison_error);
+  }
+}
+
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+template <typename Allocator>
+void BounceBufferCachePerThreadAndContext<Allocator>::erase_poisoned_shard_for_testing(
+  CUcontext ctx)
+{
+  auto const key = std::pair{std::this_thread::get_id(), ctx};
+  std::lock_guard const map_lock(_map_mutex);
+  auto const it = _shards.find(key);
+  KVIKIO_EXPECT(
+    it != _shards.end(), "test cleanup could not find poisoned shard", std::logic_error);
+  {
+    std::lock_guard const shard_lock(it->second->mutex);
+    KVIKIO_EXPECT(
+      it->second->poisoned, "test cleanup refuses to erase a healthy shard", std::logic_error);
+    KVIKIO_EXPECT(it->second->in_flight == 0 && it->second->free.empty(),
+                  "test cleanup refuses to erase a shard that still owns buffers",
+                  std::logic_error);
+  }
+  _shards.erase(it);
+}
+#endif
+
+template <typename Allocator>
 void BounceBufferCachePerThreadAndContext<Allocator>::recycle_now(CUcontext ctx, Buffer&& buf)
 {
   KVIKIO_NVTX_FUNC_RANGE();
   auto& shard = get_shard(ctx);
   std::lock_guard const lock(shard.mutex);
-  --shard.checked_out;
   shard.free.push_back(std::move(buf));
+  --shard.checked_out;
 }
 
 template <typename Allocator>
@@ -130,32 +227,90 @@ void BounceBufferCachePerThreadAndContext<Allocator>::recycle_after(
   CUcontext ctx, Buffer&& buf, CUstream stream, std::function<void()> on_recycle)
 {
   KVIKIO_NVTX_FUNC_RANGE();
-  auto& shard = get_shard(ctx);
-  auto data = std::make_unique<RecycleCallbackData>(&shard, std::move(buf), std::move(on_recycle));
-
-  // Phase A (`checked_out`) ends and Phase B (`in_flight`) starts.
-  {
-    std::lock_guard const lock(shard.mutex);
-    --shard.checked_out;
-    ++shard.in_flight;
-  }
-
   try {
-    KVIKIO_CUDA_DRIVER_TRY(
-      cudaAPI::instance().LaunchHostFunc(stream, &recycle_callback, data.get()));
+    auto& shard = get_shard(ctx);
+    // Allocate every piece of callback state before taking the caller's buffer. On allocation
+    // failure the source remains intact so this function can synchronize and recover it.
+    auto data = std::make_unique<RecycleCallbackData>(
+      this, &shard, Buffer{nullptr, nullptr, 0}, std::move(on_recycle));
+
+    // Phase A (`checked_out`) ends and Phase B (`in_flight`) starts while the caller still owns the
+    // buffer. If the accounting lock or validation fails, recovery can synchronize the intact
+    // source.
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+    maybe_inject_recycle_failure(BounceBufferCacheFailurePoint::ACCOUNTING_TRANSITION);
+#endif
+    {
+      std::lock_guard const lock(shard.mutex);
+      KVIKIO_EXPECT(shard.checked_out > 0,
+                    "recycle_after received a buffer that is not checked out",
+                    std::logic_error);
+      --shard.checked_out;
+      ++shard.in_flight;
+    }
+
+    // Buffer move assignment is noexcept. No fallible work occurs between the accounting
+    // transition and callback ownership.
+    data->buffer = std::move(buf);
+
+    try {
+      KVIKIO_CUDA_DRIVER_TRY(
+        cudaAPI::instance().LaunchHostFunc(stream, &recycle_callback, data.get()));
+    } catch (...) {
+      auto const primary_error = std::current_exception();
+      // The H2D was enqueued before this callback. If callback submission fails, do not return its
+      // source allocation to the pool until the stream has drained.
+      bool reuse_is_safe{true};
+      try {
+        KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+      } catch (...) {
+        auto const sync_error = std::current_exception();
+        reuse_is_safe         = false;
+        // CUDA cannot establish that DMA has stopped reading this allocation. Intentionally leak
+        // it instead of exposing it to a later network receive.
+        std::ignore = data->buffer.release();
+        _emergency_poisoned.store(true, std::memory_order_release);
+        try {
+          std::lock_guard const lock(shard.mutex);
+          shard.poisoned = true;
+        } catch (...) {
+        }
+        log_failure_noexcept("recycle_after: stream synchronization failed: ", sync_error);
+      }
+      // `data` still owns the payload, so its destructor returns the now-drained buffer to the
+      // underlying pool. The buffer leaves this shard, so only decrement in_flight. When
+      // synchronization also fails, retain the leaked slot in capacity accounting and poison the
+      // cache.
+      if (reuse_is_safe) {
+        try {
+          std::lock_guard const lock(shard.mutex);
+          --shard.in_flight;
+        } catch (...) {
+          _emergency_poisoned.store(true, std::memory_order_release);
+        }
+      }
+      std::rethrow_exception(primary_error);
+    }
+
+    // The callback owns the heap payload. Here we disown it so this unique_ptr's destructor does
+    // not also delete it. If the callback has already run on another thread and freed the payload,
+    // `release()` returns a dangling pointer, which we ignore, so that is harmless.
+    std::ignore = data.release();
   } catch (...) {
-    // LaunchHostFunc throws, and the callback is never enqueued. `data` still owns the payload, so
-    // its destructor returns the buffer to BounceBufferPool during unwinding. The buffer leaves the
-    // shard, so we only decrement in_flight and not restore checked_out.
-    std::lock_guard const lock(shard.mutex);
-    --shard.in_flight;
+    if (buf.get() != nullptr) {
+      // Allocation or accounting failed before ownership transfer. The H2D precedes this call, so
+      // drain it before restoring the still-local source to the cache.
+      try {
+        KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+        recycle_now(ctx, std::move(buf));
+      } catch (...) {
+        // Recovery could not restore the source without risking reuse. Keep the slot charged and
+        // poison the shard before leaking it.
+        abandon_checked_out_after_failed_sync(ctx, std::move(buf));
+      }
+    }
     throw;
   }
-
-  // The callback owns the heap payload. Here we disown it so this unique_ptr's destructor does
-  // not also delete it. If the callback has already run on another thread and freed the payload,
-  // `release()` returns a dangling pointer, which we ignore, so that is harmless.
-  std::ignore = data.release();
 }
 
 template <typename Allocator>
@@ -166,15 +321,30 @@ void CUDA_CB BounceBufferCachePerThreadAndContext<Allocator>::recycle_callback(v
   try {
     {
       std::lock_guard const lock(data->shard->mutex);
-      --data->shard->in_flight;
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+      maybe_inject_recycle_failure(BounceBufferCacheFailurePoint::CALLBACK_INSERTION);
+#endif
       data->shard->free.push_back(std::move(data->buffer));
+      --data->shard->in_flight;
     }
-    if (data->on_recycle) { data->on_recycle(); }
-  } catch (std::exception const& e) {
-    KVIKIO_LOG_ERROR(std::string("BounceBufferCachePerThreadAndContext::recycle_callback: ") +
-                     e.what());
   } catch (...) {
-    KVIKIO_LOG_ERROR("BounceBufferCachePerThreadAndContext::recycle_callback: unknown exception");
+    auto const failure = std::current_exception();
+    // Buffer destruction routes through BounceBufferPool and can invoke CUDA when the configured
+    // buffer size changed. Detach the allocation before callback state unwinds, then prevent this
+    // cache from handing out a buffer whose recycle accounting is no longer trustworthy.
+    std::ignore = data->buffer.release();
+    data->owner->_emergency_poisoned.store(true, std::memory_order_release);
+    log_failure_noexcept("BounceBufferCachePerThreadAndContext::recycle_callback: ", failure);
+    return;
+  }
+
+  try {
+    if (data->on_recycle) { data->on_recycle(); }
+  } catch (...) {
+    // Buffer ownership and accounting are already safe; a notification failure must not poison
+    // the cache or escape a CUDA callback.
+    log_failure_noexcept("BounceBufferCachePerThreadAndContext::recycle_callback notification: ",
+                         std::current_exception());
   }
 }
 

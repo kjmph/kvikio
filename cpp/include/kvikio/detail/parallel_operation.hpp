@@ -7,7 +7,9 @@
 #include <atomic>
 #include <cassert>
 #include <future>
+#include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -146,6 +148,121 @@ struct ParallelIoOptions {
   }
 };
 
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+/**
+ * @brief Failure points used to verify exceptional `parallel_io` task lifetime.
+ */
+enum class ParallelIoFailurePoint {
+  TASK_SUBMISSION,
+  FINAL_TASK_CONSTRUCTION,
+  FINAL_TASK_SUBMISSION
+};
+
+namespace parallel_io_failure_injection {
+inline constexpr auto disabled = std::numeric_limits<std::size_t>::max();
+inline std::atomic<ParallelIoFailurePoint> point{ParallelIoFailurePoint::TASK_SUBMISSION};
+inline std::atomic<std::size_t> countdown{disabled};
+}  // namespace parallel_io_failure_injection
+
+/**
+ * @brief Inject a `std::bad_alloc` at a selected `parallel_io` failure point.
+ *
+ * At `TASK_SUBMISSION`, @p successful_reaches is the number of task submissions allowed before the
+ * injected failure. The other points are reached once per call and normally use zero.
+ */
+inline void inject_parallel_io_failure_for_testing(ParallelIoFailurePoint point,
+                                                   std::size_t successful_reaches = 0) noexcept
+{
+  parallel_io_failure_injection::point.store(point, std::memory_order_relaxed);
+  parallel_io_failure_injection::countdown.store(successful_reaches, std::memory_order_release);
+}
+
+inline void maybe_inject_parallel_io_failure(ParallelIoFailurePoint point)
+{
+  using namespace parallel_io_failure_injection;
+  if (parallel_io_failure_injection::point.load(std::memory_order_relaxed) != point) { return; }
+
+  auto remaining = countdown.load(std::memory_order_acquire);
+  while (remaining != disabled) {
+    if (remaining == 0) {
+      if (countdown.compare_exchange_weak(
+            remaining, disabled, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        throw std::bad_alloc{};
+      }
+    } else if (countdown.compare_exchange_weak(
+                 remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      return;
+    }
+  }
+}
+#endif
+
+/**
+ * @brief Shared owner that drains submitted tasks before their target storage can unwind.
+ *
+ * `parallel_io` creates this object and reserves its complete capacity before submitting the first
+ * task. The final waiter captures it by shared ownership. If a later submission or construction of
+ * that waiter throws, stack unwinding releases the last owner and this destructor waits for every
+ * task that was already issued.
+ */
+class ParallelIoSubmittedTasks {
+ public:
+  struct DrainResult {
+    std::size_t bytes{};
+    std::exception_ptr first_error{};
+  };
+
+  explicit ParallelIoSubmittedTasks(std::size_t capacity) { _tasks.reserve(capacity); }
+
+  ParallelIoSubmittedTasks(ParallelIoSubmittedTasks const&)            = delete;
+  ParallelIoSubmittedTasks& operator=(ParallelIoSubmittedTasks const&) = delete;
+
+  ~ParallelIoSubmittedTasks() noexcept { std::ignore = drain(); }
+
+  void push(std::future<std::size_t> task)
+  {
+    if (_tasks.size() == _tasks.capacity()) {
+      // This is a defensive invariant check. Drain the otherwise-untracked task before reporting a
+      // KvikIO logic error, then let this object's destructor drain all earlier tasks.
+      try {
+        std::ignore = task.get();
+      } catch (...) {
+      }
+      KVIKIO_FAIL("parallel_io submitted-task capacity exhausted", std::logic_error);
+    }
+    try {
+      _tasks.push_back(std::move(task));
+    } catch (...) {
+      auto const insertion_error = std::current_exception();
+      if (task.valid()) {
+        try {
+          std::ignore = task.get();
+        } catch (...) {
+        }
+      }
+      std::rethrow_exception(insertion_error);
+    }
+  }
+
+  [[nodiscard]] DrainResult drain() noexcept
+  {
+    DrainResult result;
+    for (auto& task : _tasks) {
+      if (!task.valid()) { continue; }
+      try {
+        result.bytes += task.get();
+      } catch (...) {
+        if (result.first_error == nullptr) { result.first_error = std::current_exception(); }
+      }
+    }
+    _tasks.clear();
+    return result;
+  }
+
+ private:
+  std::vector<std::future<std::size_t>> _tasks;
+};
+
 /**
  * @brief Apply read or write operation in parallel.
  *
@@ -199,13 +316,30 @@ std::future<std::size_t> parallel_io(F op,
       single_task, buf, size, file_offset, devPtr_offset, opts.to_task_options());
   }
 
-  std::vector<std::future<std::size_t>> tasks;
-  tasks.reserve(size / task_size + 1);
+  auto const actual_first_task_size = opts.first_task_size.value_or(task_size);
+  KVIKIO_EXPECT(actual_first_task_size > 0,
+                "`first_task_size` must be positive when specified",
+                std::invalid_argument);
+  KVIKIO_EXPECT(actual_first_task_size <= task_size,
+                "`first_task_size` must not exceed `task_size`",
+                std::invalid_argument);
+  auto const first_size            = std::min(actual_first_task_size, size);
+  auto const remaining_after_first = size - first_size;
+  auto const remaining_task_count =
+    remaining_after_first == 0 ? std::size_t{0} : 1 + (remaining_after_first - 1) / task_size;
+  auto const total_task_count = 1 + remaining_task_count;
+
+  // Allocate the shared state and all future slots before the first task can touch caller-owned
+  // storage. Every task except the final waiter is retained here.
+  auto submitted_tasks =
+    std::make_shared<ParallelIoSubmittedTasks>(total_task_count - std::size_t{1});
 
   // 1) Submit the first task (possibly shorter to satisfy caller alignment needs).
-  auto const actual_first_task_size = opts.first_task_size.value_or(task_size);
-  auto cur_size                     = std::min(actual_first_task_size, size);
-  tasks.push_back(
+  auto cur_size = first_size;
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+  maybe_inject_parallel_io_failure(ParallelIoFailurePoint::TASK_SUBMISSION);
+#endif
+  submitted_tasks->push(
     detail::submit_task(op, buf, cur_size, file_offset, devPtr_offset, opts.to_task_options()));
   file_offset += cur_size;
   devPtr_offset += cur_size;
@@ -213,7 +347,10 @@ std::future<std::size_t> parallel_io(F op,
 
   // 2) Submit remaining tasks but the last. These are all `task_size` sized.
   while (size > task_size) {
-    tasks.push_back(
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+    maybe_inject_parallel_io_failure(ParallelIoFailurePoint::TASK_SUBMISSION);
+#endif
+    submitted_tasks->push(
       detail::submit_task(op, buf, task_size, file_offset, devPtr_offset, opts.to_task_options()));
     file_offset += task_size;
     devPtr_offset += task_size;
@@ -222,31 +359,38 @@ std::future<std::size_t> parallel_io(F op,
 
   // 3) Submit the last task, which consists of performing the last I/O and waiting the previous
   // tasks.
-  auto last_task = [=, tasks = std::move(tasks), rec = opts.recorder]() mutable -> std::size_t {
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+  maybe_inject_parallel_io_failure(ParallelIoFailurePoint::FINAL_TASK_CONSTRUCTION);
+#endif
+  auto last_task =
+    [op, buf, size, file_offset, devPtr_offset, submitted_tasks, rec = opts.recorder]() mutable
+    -> std::size_t {
     // This task both performs the final part and waits for the others, so it is where the logical
     // operation actually completes, and therefore where its observation is emitted.
+    std::size_t ret{};
+    std::exception_ptr first_error;
     try {
-      auto ret = op(buf, size, file_offset, devPtr_offset);
-      for (auto& task : tasks) {
-        ret += task.get();
-      }
-      if (rec) { rec->finish(ret); }
-      return ret;
+      ret = op(buf, size, file_offset, devPtr_offset);
     } catch (...) {
-      // The other tasks may still be running. Wait for them, so the operation really is over both
-      // when the exception reaches the caller and when the failure is reported.
-      for (auto& task : tasks) {
-        if (!task.valid()) { continue; }
-        try {
-          task.get();
-        } catch (...) {  // NOLINT(bugprone-empty-catch)
-          // The first failure is the one that is propagated.
-        }
-      }
-      if (rec) { rec->finish_with_failure(); }
-      throw;
+      // Preserve the final task's failure, matching the existing execution order, but still wait
+      // for every earlier task before exposing it.
+      first_error = std::current_exception();
     }
+
+    auto const previous = submitted_tasks->drain();
+    ret += previous.bytes;
+    if (first_error == nullptr) { first_error = previous.first_error; }
+
+    if (first_error != nullptr) {
+      if (rec) { rec->finish_with_failure(); }
+      std::rethrow_exception(first_error);
+    }
+    if (rec) { rec->finish(ret); }
+    return ret;
   };
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+  maybe_inject_parallel_io_failure(ParallelIoFailurePoint::FINAL_TASK_SUBMISSION);
+#endif
   return detail::submit_move_only_task(std::move(last_task), opts.to_task_options());
 }
 

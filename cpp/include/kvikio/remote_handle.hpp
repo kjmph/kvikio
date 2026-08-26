@@ -504,6 +504,11 @@ class RemoteHandle {
    * @param size Number of bytes to read.
    * @param file_offset File offset in bytes.
    * @return Number of bytes read, which is always `size`.
+   *
+   * @note A device read does not return, successfully or exceptionally, until its H2D work is
+   * quiescent. If stream synchronization fails, KvikIO uses a context-wide CUDA fence before
+   * propagating the error. Failure of that last-resort fence terminates the process because the
+   * destination-buffer lifetime cannot otherwise be made safe.
    */
   std::size_t read(void* buf, std::size_t size, std::size_t file_offset = 0);
 
@@ -516,9 +521,10 @@ class RemoteHandle {
    *  - `EASY_THREADPOOL` (default): each sub-range runs on a worker of the supplied `thread_pool`,
    *     blocking in `curl_easy_perform()`.
    *  - `MULTI_POLL`: each sub-range is handed to a process-wide reactor pool that drives many
-   *    libcurl easy handles via `curl_multi_poll()`. The `thread_pool` argument is ignored. The
-   *    first failure surfaces via the returned future. See `KVIKIO_REMOTE_IO_NUM_REACTORS` and
-   *    `KVIKIO_REMOTE_IO_REACTOR_DISPATCH` for tuning knobs.
+   *    libcurl easy handles via `curl_multi_poll()`. The `thread_pool` argument is ignored. After
+   *    every sub-range reaches a terminal state, the first failure surfaces via the returned
+   *    future. See `KVIKIO_REMOTE_IO_NUM_REACTORS` and `KVIKIO_REMOTE_IO_REACTOR_DISPATCH` for
+   *    tuning knobs.
    *
    * @param buf Pointer to host or device memory.
    * @param size Number of bytes to read.
@@ -529,9 +535,17 @@ class RemoteHandle {
    * until the returned future is consumed.
    * @return Future that on completion returns the number of bytes read, which is always `size`.
    *
-   * @note The returned `std::future` must not outlive the `RemoteHandle` (both backends). Under
-   * EASY_THREADPOOL it must additionally not outlive the supplied `thread_pool`. Calling `wait()`
-   * or `get()` on the future after either has been destroyed results in undefined behavior.
+   * @note The caller must consume the returned future through `get()` before reading, reusing, or
+   * destroying `buf`, and the future must not outlive the `RemoteHandle` (both backends).
+   * Destroying the future does not cancel the read; for a MULTI_POLL device read it also does not
+   * execute the deferred CUDA lifetime fence. Under EASY_THREADPOOL the future must additionally
+   * not outlive the supplied `thread_pool`. Violating these lifetime requirements results in
+   * undefined behavior.
+   *
+   * A consumed MULTI_POLL device future does not return, successfully or exceptionally, until all
+   * submitted H2D work is quiescent. If per-event synchronization cannot establish that lifetime
+   * boundary, KvikIO uses a context-wide CUDA fence. Failure of the last-resort fence terminates
+   * the process because releasing a destination that CUDA may still access cannot be made safe.
    */
   std::future<std::size_t> pread(void* buf,
                                  std::size_t size,

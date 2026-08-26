@@ -131,6 +131,14 @@ std::size_t BounceBufferPool<Allocator>::Buffer::size() const noexcept
 }
 
 template <typename Allocator>
+void* BounceBufferPool<Allocator>::Buffer::release() noexcept
+{
+  _pool = nullptr;
+  _size = 0;
+  return std::exchange(_buffer, nullptr);
+}
+
+template <typename Allocator>
 void BounceBufferPool<Allocator>::_deallocate_buffers(std::stack<void*>& buffers,
                                                       std::size_t buffer_size)
 {

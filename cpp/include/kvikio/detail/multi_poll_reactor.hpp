@@ -65,8 +65,8 @@ class MultiReactorPool;  // Forward declaration, because reactors needs to hold 
   std::optional<std::size_t> max_concurrent_requests) noexcept;
 
 /**
- * @brief Collects results from N sub-range transfers and resolves one top-level future once all of
- * them have either succeeded or one has failed.
+ * @brief Collects results from N sub-range transfers and resolves one top-level future once every
+ * sub-range has either succeeded or failed.
  *
  * Every sub-range transfer belonging to a single `RemoteHandle::pread()` call holds a
  * `std::shared_ptr<RemoteMultiAggregateContext>`. As completions arrive on the reactor threads
@@ -193,6 +193,10 @@ struct RemoteMultiTransfer {
   void* device_dst{nullptr};
   CudaPinnedBounceBufferPool::Buffer buffer{nullptr, nullptr, 0};
 
+  // Guards the aggregate promise against duplicate terminal callbacks while transfer ownership
+  // moves through exceptional reactor paths.
+  bool aggregate_terminal_reported{false};
+
   // Retry bookkeeping. Number of attempts that have finished.
   std::size_t attempt{0};
 
@@ -210,6 +214,32 @@ struct RemoteMultiTransfer {
   ~RemoteMultiTransfer();
 };
 
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+/**
+ * @brief Make the next reactor submission throw after this many successful inbox insertions.
+ *
+ * The hook resets itself after firing and is compiled only into test builds.
+ */
+void inject_multi_poll_submission_failure_after_for_testing(
+  std::size_t successful_insertions) noexcept;
+
+/**
+ * @brief Make the next reactor admission throw before reserving its in-flight map node.
+ *
+ * The hook resets itself after firing and is compiled only into test builds.
+ */
+void inject_multi_poll_admission_failure_after_for_testing(
+  std::size_t successful_admissions) noexcept;
+
+/**
+ * @brief Make reactor-pool construction fail after this many reactors are started.
+ *
+ * The hook resets itself after firing and is compiled only into test builds.
+ */
+void inject_multi_poll_reactor_construction_failure_after_for_testing(
+  std::size_t successful_reactors) noexcept;
+#endif
+
 /**
  * @brief One reactor has one `CURLM*`, one I/O thread, one submit queue, one in-flight map.
  *
@@ -218,9 +248,9 @@ struct RemoteMultiTransfer {
  * The only cross-thread libcurl call is `curl_multi_wakeup()`, used by `submit()` to nudge the
  * reactor out of its poll.
  *
- * @note Instances are intentionally never destroyed. They are owned by the leaked
- * `MultiReactorPool` singleton, so their dtor body is empty. Reactor threads run until the process
- * exits.
+ * @note Instances are intentionally never destroyed after successful singleton construction.
+ * Their destructor exists so a partially constructed `MultiReactorPool` can clean up reactors
+ * after startup fails.
  */
 class MultiPollReactor {
  public:
@@ -250,9 +280,13 @@ class MultiPollReactor {
    * the pool has already declared death, every transfer in the batch is failed immediately with
    * the recorded death reason and never enters the inbox.
    *
+   * Once any transfer is visible to a reactor this call never propagates an exception. A queue
+   * allocation failure declares the pool dead and resolves every transfer through its aggregate,
+   * preserving the caller's future and device-I/O fence contract.
+   *
    * @param transfers Per-transfer state, ownership transferred to the reactor.
    */
-  void submit(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers);
+  void submit(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers) noexcept;
 
   /**
    * @brief Wake up the reactor out of its `curl_multi_poll()` wait. Thread-safe.
@@ -264,6 +298,14 @@ class MultiPollReactor {
   void wakeup() noexcept;
 
  private:
+  friend class MultiReactorPool;
+
+  /** @brief Start the reactor thread after the pool has published its complete reactor set. */
+  void start();
+
+  /** @brief Request shutdown and join the reactor thread, if it was started. */
+  void stop() noexcept;
+
   /**
    * @brief Set this reactor's libcurl connection cache (`CURLMOPT_MAXCONNECTS`).
    *
@@ -303,6 +345,7 @@ class MultiPollReactor {
   ConcurrentRequestLimiter _request_limiter;
   CURLM* _curl_multi{nullptr};
   std::thread _io_thread;
+  std::atomic<bool> _stop{false};
   std::mutex _submit_mutex;
   std::deque<std::unique_ptr<RemoteMultiTransfer>> _inbox;
   std::deque<std::unique_ptr<RemoteMultiTransfer>> _pending;
@@ -354,8 +397,7 @@ class MultiReactorPool {
   void submit_pread(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers);
 
   /**
-   * @brief Whether the pool has been marked dead by a reactor that has caught a fatal libcurl
-   * error.
+   * @brief Whether the pool has been marked dead by a fatal reactor or ownership-handoff error.
    *
    * Once dead, the pool stays dead for the rest of the process lifetime. All in-flight and
    * subsequently submitted transfers fail with the recorded death reason.
@@ -379,17 +421,30 @@ class MultiReactorPool {
    */
   void signal_death(std::exception_ptr eptr) noexcept;
 
+  /**
+   * @brief Wake every reactor so it promptly observes a process-wide state change.
+   */
+  void wakeup_all() noexcept;
+
  private:
+  friend class MultiPollReactor;
+
   MultiReactorPool();
   ~MultiReactorPool() noexcept;
 
-  std::vector<std::unique_ptr<MultiPollReactor>> _reactors;
   RemoteReactorDispatch _dispatch;
+  // Makes the handoff of all reactor buckets from one pread atomic with respect to inbox draining.
+  // Without this gate, a PER_CHUNK reactor could begin I/O before a later reactor's queue
+  // allocation fails, leaving the caller without one coherent future/fence lifecycle.
+  std::mutex _submission_mutex;
   // Round-robin counter. Incremented per pread (PER_PREAD) or per chunk (PER_CHUNK).
   std::atomic<std::size_t> _next_reactor_counter{0};
   std::atomic<bool> _dead{false};
   std::mutex mutable _death_mutex;  // Protects writes to `_death_reason`.
   std::exception_ptr _death_reason;
+  // Keep reactor ownership last so an explicitly destroyed pool stops and joins every reactor
+  // before destroying the synchronization and death-state members their threads inspect.
+  std::vector<std::unique_ptr<MultiPollReactor>> _reactors;
 };
 
 }  // namespace kvikio::detail

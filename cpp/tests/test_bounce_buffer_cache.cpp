@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <new>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -28,6 +30,66 @@ CUcontext current_context()
   KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().CtxGetCurrent(&ctx));
   return ctx;
 }
+
+struct StreamGate {
+  std::atomic<bool> entered{false};
+  std::atomic<bool> release{false};
+};
+
+void CUDA_CB wait_at_stream_gate(void* opaque)
+{
+  auto& gate = *static_cast<StreamGate*>(opaque);
+  gate.entered.store(true, std::memory_order_release);
+  while (!gate.release.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+}
+
+void CUDA_CB mark_stream_complete(void* opaque)
+{
+  static_cast<std::atomic<bool>*>(opaque)->store(true, std::memory_order_release);
+}
+
+CUresult CUDAAPI fail_launch_host_func(CUstream, CUhostFn, void*)
+{
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult CUDAAPI fail_stream_synchronize(CUstream) { return CUDA_ERROR_INVALID_VALUE; }
+
+class ScopedLaunchHostFuncOverride {
+ public:
+  using Function = decltype(kvikio::cudaAPI::instance().LaunchHostFunc);
+
+  explicit ScopedLaunchHostFuncOverride(Function replacement)
+    : _slot{kvikio::cudaAPI::instance().LaunchHostFunc}, _saved{_slot}
+  {
+    _slot = replacement;
+  }
+
+  ~ScopedLaunchHostFuncOverride() { _slot = _saved; }
+
+ private:
+  Function& _slot;
+  Function _saved;
+};
+
+class ScopedStreamSynchronizeOverride {
+ public:
+  using Function = decltype(kvikio::cudaAPI::instance().StreamSynchronize);
+
+  explicit ScopedStreamSynchronizeOverride(Function replacement)
+    : _slot{kvikio::cudaAPI::instance().StreamSynchronize}, _saved{_slot}
+  {
+    _slot = replacement;
+  }
+
+  ~ScopedStreamSynchronizeOverride() { _slot = _saved; }
+
+ private:
+  Function& _slot;
+  Function _saved;
+};
 
 }  // namespace
 
@@ -124,6 +186,112 @@ TEST_F(BounceBufferCacheTest, recycle_after_round_trip)
   KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
 }
 
+TEST_F(BounceBufferCacheTest, recycle_callback_submission_failure_preserves_slot_accounting)
+{
+  kvikio::detail::BounceBufferCachePerThreadAndContext<kvikio::CudaPinnedAllocator> cache(1);
+  auto ctx = current_context();
+
+  CUstream stream{};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&stream, CU_STREAM_DEFAULT));
+  auto buffer = cache.try_get(ctx);
+  ASSERT_TRUE(buffer.has_value());
+
+  {
+    ScopedLaunchHostFuncOverride const override{&fail_launch_host_func};
+    EXPECT_THROW(cache.recycle_after(ctx, std::move(*buffer), stream), std::exception);
+  }
+
+  // Launch failure drains the stream and removes the slot from this shard. The outer recovery sees
+  // that ownership already moved and must not decrement checked_out a second time.
+  auto replacement = cache.try_get(ctx);
+  EXPECT_TRUE(replacement.has_value());
+  if (replacement.has_value()) { cache.recycle_now(ctx, std::move(*replacement)); }
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
+}
+
+TEST_F(BounceBufferCacheTest, accounting_failure_leaves_source_owned_for_synchronized_recovery)
+{
+  using Cache = kvikio::detail::BounceBufferCachePerThreadAndContext<kvikio::CudaPinnedAllocator>;
+  Cache cache(1);
+  auto ctx = current_context();
+
+  CUstream stream{};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&stream, CU_STREAM_DEFAULT));
+  auto buffer = cache.try_get(ctx);
+  ASSERT_TRUE(buffer.has_value());
+  auto* const original = buffer->get();
+
+  std::atomic<bool> preceding_work_completed{false};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().LaunchHostFunc(
+    stream, &mark_stream_complete, &preceding_work_completed));
+  kvikio::detail::inject_bounce_buffer_cache_failure_for_testing(
+    kvikio::detail::BounceBufferCacheFailurePoint::ACCOUNTING_TRANSITION);
+  EXPECT_THROW(cache.recycle_after(ctx, std::move(*buffer), stream), std::bad_alloc);
+
+  // The recycle path must synchronize preceding stream work and recover the still-owned buffer
+  // after callback-state accounting fails.
+  EXPECT_TRUE(preceding_work_completed.load(std::memory_order_acquire));
+  auto recycled = cache.try_get(ctx);
+  ASSERT_TRUE(recycled.has_value());
+  EXPECT_EQ(recycled->get(), original);
+  cache.recycle_now(ctx, std::move(*recycled));
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
+}
+
+TEST_F(BounceBufferCacheTest, callback_insertion_failure_detaches_buffers_and_poisons_cache)
+{
+  using Cache = kvikio::detail::BounceBufferCachePerThreadAndContext<kvikio::CudaPinnedAllocator>;
+  Cache cache(std::nullopt);
+  auto ctx = current_context();
+
+  CUstream stream{};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&stream, CU_STREAM_DEFAULT));
+  auto buffer = cache.try_get(ctx);
+  ASSERT_TRUE(buffer.has_value());
+  auto* const allocation      = buffer->get();
+  auto const allocation_size  = buffer->size();
+  auto& underlying_pool       = kvikio::CudaPinnedBounceBufferPool::instance();
+  auto const pool_free_before = underlying_pool.num_free_buffers();
+
+  kvikio::detail::inject_bounce_buffer_cache_failure_for_testing(
+    kvikio::detail::BounceBufferCacheFailurePoint::CALLBACK_INSERTION);
+  cache.recycle_after(ctx, std::move(*buffer), stream);
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamSynchronize(stream));
+
+  // A CUDA callback cannot safely return a pinned allocation through the global pool because its
+  // exceptional paths can invoke CUDA. The injected insertion failure must detach it and fail the
+  // cache closed instead.
+  EXPECT_THROW(std::ignore = cache.try_get(ctx), std::runtime_error);
+  ASSERT_EQ(underlying_pool.num_free_buffers(), pool_free_before);
+
+  // Failure injection is synchronized, so the test thread can reclaim the deliberately detached
+  // allocation without issuing a CUDA API from the callback thread.
+  kvikio::CudaPinnedAllocator{}.deallocate(allocation, allocation_size);
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
+}
+
+TEST_F(BounceBufferCacheTest, failed_callback_and_sync_poison_cache_without_replacement_allocation)
+{
+  kvikio::detail::BounceBufferCachePerThreadAndContext<kvikio::CudaPinnedAllocator> cache(1);
+  auto ctx = current_context();
+
+  CUstream stream{};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&stream, CU_STREAM_DEFAULT));
+  auto buffer = cache.try_get(ctx);
+  ASSERT_TRUE(buffer.has_value());
+
+  {
+    ScopedLaunchHostFuncOverride const launch_override{&fail_launch_host_func};
+    ScopedStreamSynchronizeOverride const sync_override{&fail_stream_synchronize};
+    EXPECT_THROW(cache.recycle_after(ctx, std::move(*buffer), stream), std::exception);
+  }
+
+  // CUDA could not prove the leaked source slot was quiescent. The shard must fail closed instead
+  // of dropping its in-flight count and allocating an unbounded sequence of replacements.
+  EXPECT_THROW(std::ignore = cache.try_get(ctx), std::runtime_error);
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
+}
+
 TEST_F(BounceBufferCacheTest, recycle_after_releases_in_flight_slot)
 {
   kvikio::detail::BounceBufferCachePerThreadAndContext<kvikio::CudaPinnedAllocator> cache(2);
@@ -151,6 +319,47 @@ TEST_F(BounceBufferCacheTest, recycle_after_releases_in_flight_slot)
   EXPECT_TRUE(b.has_value());
   cache.recycle_now(ctx, std::move(*b));
 
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
+}
+
+TEST_F(BounceBufferCacheTest, recycle_after_retains_source_until_stream_reaches_callback)
+{
+  kvikio::detail::BounceBufferCachePerThreadAndContext<kvikio::CudaPinnedAllocator> cache(1);
+  auto ctx = current_context();
+
+  CUstream stream{};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&stream, CU_STREAM_DEFAULT));
+
+  auto buffer = cache.try_get(ctx);
+  ASSERT_TRUE(buffer.has_value());
+  auto* const original = buffer->get();
+
+  StreamGate gate;
+  KVIKIO_CUDA_DRIVER_TRY(
+    kvikio::cudaAPI::instance().LaunchHostFunc(stream, &wait_at_stream_gate, &gate));
+  cache.recycle_after(ctx, std::move(*buffer), stream);
+
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (!gate.entered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  if (!gate.entered.load(std::memory_order_acquire)) {
+    gate.release.store(true, std::memory_order_release);
+    std::ignore = kvikio::cudaAPI::instance().StreamSynchronize(stream);
+    std::ignore = kvikio::cudaAPI::instance().StreamDestroy(stream);
+    FAIL() << "CUDA stream did not reach the lifetime gate";
+  }
+
+  // The cached pinned buffer remains unavailable while the preceding H2D work is still in flight.
+  EXPECT_FALSE(cache.try_get(ctx).has_value());
+  gate.release.store(true, std::memory_order_release);
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamSynchronize(stream));
+
+  auto recycled = cache.try_get(ctx);
+  ASSERT_TRUE(recycled.has_value());
+  EXPECT_EQ(recycled->get(), original);
+  cache.recycle_now(ctx, std::move(*recycled));
   KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
 }
 

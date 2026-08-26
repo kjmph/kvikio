@@ -15,9 +15,11 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
+#include <kvikio/detail/cuda_fence.hpp>
 #include <kvikio/detail/env.hpp>
 #include <kvikio/detail/http_retry.hpp>
 #include <kvikio/detail/io_event_barrier.hpp>
@@ -44,6 +46,7 @@ namespace detail {
  * @note Not thread-safe.
  */
 class BounceBufferH2D {
+  CUcontext _context;                               // CUDA context that owns the output buffer.
   CUstream _stream;                                 // The CUDA stream to use.
   CUdeviceptr _dev;                                 // The output device buffer.
   CudaPinnedBounceBufferPool::Buffer _host_buffer;  // The host buffer to bounce data on.
@@ -54,11 +57,13 @@ class BounceBufferH2D {
   /**
    * @brief Create a bounce buffer for an output device buffer.
    *
+   * @param context CUDA context that owns @p device_buffer and @p stream.
    * @param stream The CUDA stream used throughout the lifetime of the bounce buffer.
    * @param device_buffer The output device buffer (final destination of the data).
    */
-  BounceBufferH2D(CUstream stream, void* device_buffer)
-    : _stream{stream},
+  BounceBufferH2D(CUcontext context, CUstream stream, void* device_buffer)
+    : _context{context},
+      _stream{stream},
       _dev{convert_void2deviceptr(device_buffer)},
       _host_buffer{CudaPinnedBounceBufferPool::instance().get()}
   {
@@ -73,10 +78,16 @@ class BounceBufferH2D {
     KVIKIO_NVTX_FUNC_RANGE();
     try {
       flush();
-    } catch (CUfileException const& e) {
-      std::cerr << "BounceBufferH2D error on final flush: ";
-      std::cerr << e.what();
-      std::cerr << std::endl;
+    } catch (std::exception const& e) {
+      try {
+        std::cerr << "BounceBufferH2D error on final flush: " << e.what() << std::endl;
+      } catch (...) {
+      }
+    } catch (...) {
+      try {
+        std::cerr << "BounceBufferH2D unknown error on final flush" << std::endl;
+      } catch (...) {
+      }
     }
   }
 
@@ -91,9 +102,11 @@ class BounceBufferH2D {
   {
     KVIKIO_NVTX_FUNC_RANGE();
     if (size > 0) {
-      KVIKIO_CUDA_DRIVER_TRY(
-        cudaAPI::cuda_memcpy_async(_dev + _dev_offset, convert_void2deviceptr(src), size, _stream));
-      KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(_stream));
+      run_with_context_fence_on_failure(_context, [&] {
+        KVIKIO_CUDA_DRIVER_TRY(cudaAPI::cuda_memcpy_async(
+          _dev + _dev_offset, convert_void2deviceptr(src), size, _stream));
+        KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(_stream));
+      });
       _dev_offset += size;
     }
   }
@@ -104,8 +117,10 @@ class BounceBufferH2D {
   void flush()
   {
     KVIKIO_NVTX_FUNC_RANGE();
-    write_to_device(_host_buffer.get(), _host_offset);
-    _host_offset = 0;
+    // Disown the pending range before entering CUDA recovery. If the operation fails after its
+    // context-wide fence, a destructor running during exception unwind must not submit it again.
+    auto const size = std::exchange(_host_offset, std::ptrdiff_t{0});
+    write_to_device(_host_buffer.get(), size);
   }
 
  public:
@@ -139,6 +154,11 @@ class BounceBufferH2D {
    * @brief Reset the internal counters for retry.
    */
   void reset_for_retry() noexcept;
+
+  /**
+   * @brief Flush the final buffered bytes and surface any completion error to the caller.
+   */
+  void finish() { flush(); }
 };
 
 void BounceBufferH2D::reset_for_retry() noexcept
@@ -874,15 +894,20 @@ std::size_t RemoteHandle::read_impl(void* buf,
     if (is_host_mem) {
       curl.perform([&ctx] { ctx.reset_for_retry(); });
     } else {
-      PushAndPopContext c(get_context_from_pointer(buf));
+      auto const device_context = get_context_from_pointer(buf);
+      PushAndPopContext c(device_context);
       // We use a bounce buffer to avoid many small memory copies to device. Libcurl has a
       // maximum chunk size of 16kb (`CURL_MAX_WRITE_SIZE`) but chunks are often much smaller.
-      detail::BounceBufferH2D bounce_buffer(detail::StreamCachePerThreadAndContext::get(), buf);
+      detail::BounceBufferH2D bounce_buffer(
+        device_context, detail::StreamCachePerThreadAndContext::get(), buf);
       ctx.bounce_buffer = &bounce_buffer;
       curl.perform([&ctx, &bounce_buffer] {
         ctx.reset_for_retry();
         bounce_buffer.reset_for_retry();
       });
+      // Do not leave the last short libcurl chunk to a noexcept destructor. Success is reported
+      // only after its H2D and lifetime fence complete.
+      bounce_buffer.finish();
     }
   } catch (std::runtime_error const& e) {
     if (ctx.overflow_error) {
@@ -971,11 +996,12 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
   //   threads per the captured dispatch policy. Each reactor drives its easy handles via
   //   curl_multi_poll() and fires the aggregate's per-subrange callback on completion or
   //   failure.
-  // - The aggregate fulfills the promise as soon as all sub-ranges have reported (or one
-  //   of them fails).
+  // - The aggregate fulfills the promise only after every sub-range reports; the first
+  //   failure wins. Waiting for siblings preserves the caller's buffer-lifetime boundary.
   //
   // Build all N transfers here, then hand them off in a single pool call.
-  std::size_t const num_subranges = (task_size >= size) ? 1 : (size + task_size - 1) / task_size;
+  // Avoid overflowing `size + task_size - 1` for otherwise valid near-SIZE_MAX inputs.
+  std::size_t const num_subranges = 1 + (size - 1) / task_size;
   auto aggregate      = std::make_shared<detail::RemoteMultiAggregateContext>(num_subranges);
   aggregate->recorder = recorder;
   auto fut            = aggregate->get_future();
@@ -1021,17 +1047,22 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
     remaining -= subrange_size;
   }
 
-  // One pool call per pread(). The pool consults the captured dispatch policy internally.
+  // Construct every potentially allocating completion object before publishing transfers. If
+  // std::async cannot allocate its deferred shared state, pread throws while `transfers` are still
+  // locally owned and no reactor can write to the caller's device buffer.
+  std::future<std::size_t> device_completion;
+  if (!is_host_mem) {
+    device_completion =
+      detail::make_io_completion_future(std::move(fut), std::move(io_event_barrier));
+  }
+
+  // One pool call per pread(). The pool consults the captured dispatch policy internally. Its
+  // allocating routing phase completes before any no-throw reactor handoff, preserving the same
+  // no-I/O-after-synchronous-failure contract.
   detail::MultiReactorPool::instance().submit_pread(std::move(transfers));
 
   if (is_host_mem) { return fut; }
-
-  return std::async(std::launch::deferred,
-                    [fut = std::move(fut), io_event_barrier]() mutable -> std::size_t {
-                      auto const n = fut.get();
-                      io_event_barrier->sync_all_events();
-                      return n;
-                    });
+  return device_completion;
 }
 
 }  // namespace kvikio

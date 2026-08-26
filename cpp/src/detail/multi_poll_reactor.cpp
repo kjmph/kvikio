@@ -9,6 +9,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -32,6 +33,98 @@
 
 namespace kvikio::detail {
 
+namespace {
+
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+constexpr std::size_t failure_injection_disabled = std::numeric_limits<std::size_t>::max();
+std::atomic<std::size_t> submission_failure_countdown{failure_injection_disabled};
+std::atomic<std::size_t> admission_failure_countdown{failure_injection_disabled};
+std::atomic<std::size_t> reactor_construction_failure_countdown{failure_injection_disabled};
+
+void maybe_inject_failure(std::atomic<std::size_t>& countdown)
+{
+  auto remaining = countdown.load(std::memory_order_relaxed);
+  while (remaining != failure_injection_disabled) {
+    if (remaining == 0) {
+      if (countdown.compare_exchange_weak(remaining,
+                                          failure_injection_disabled,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+        throw std::bad_alloc{};
+      }
+    } else if (countdown.compare_exchange_weak(
+                 remaining, remaining - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+#endif
+
+void log_failure_noexcept(char const* prefix, std::exception_ptr failure) noexcept
+{
+  try {
+    if (failure != nullptr) { std::rethrow_exception(failure); }
+    try {
+      KVIKIO_LOG_ERROR(std::string{prefix} + "unknown exception");
+    } catch (...) {
+    }
+  } catch (std::exception const& error) {
+    try {
+      KVIKIO_LOG_ERROR(std::string{prefix} + error.what());
+    } catch (...) {
+    }
+  } catch (...) {
+    try {
+      KVIKIO_LOG_ERROR(std::string{prefix} + "unknown exception");
+    } catch (...) {
+    }
+  }
+}
+
+void log_message_noexcept(char const* prefix, char const* message) noexcept
+{
+  try {
+    KVIKIO_LOG_ERROR(std::string{prefix} + message);
+  } catch (...) {
+  }
+}
+
+void fail_aggregate_transfer(RemoteMultiTransfer& transfer, std::exception_ptr failure) noexcept
+{
+  if (transfer.aggregate_terminal_reported) { return; }
+  transfer.aggregate_terminal_reported = true;
+  try {
+    transfer.aggregate->on_subrange_failed(std::move(failure));
+  } catch (...) {
+    // Cleanup must resolve every transfer owned by this reactor even if a broken promise or an
+    // unexpected aggregate callback failure makes one notification throw.
+    log_failure_noexcept("remote transfer aggregate failure callback threw: ",
+                         std::current_exception());
+  }
+}
+
+}  // namespace
+
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+void inject_multi_poll_submission_failure_after_for_testing(
+  std::size_t successful_insertions) noexcept
+{
+  submission_failure_countdown.store(successful_insertions, std::memory_order_relaxed);
+}
+
+void inject_multi_poll_admission_failure_after_for_testing(
+  std::size_t successful_admissions) noexcept
+{
+  admission_failure_countdown.store(successful_admissions, std::memory_order_relaxed);
+}
+
+void inject_multi_poll_reactor_construction_failure_after_for_testing(
+  std::size_t successful_reactors) noexcept
+{
+  reactor_construction_failure_countdown.store(successful_reactors, std::memory_order_relaxed);
+}
+#endif
+
 CurlMultiAttachment::CurlMultiAttachment(CURLM* multi, CURL* easy) noexcept
   : _multi{multi}, _easy{easy}
 {
@@ -45,8 +138,8 @@ void CurlMultiAttachment::reset() noexcept
     // is undefined behavior in libcurl. There is no better recovery available here.
     auto const mc = curl_multi_remove_handle(_multi, _easy);
     if (mc != CURLM_OK) {
-      KVIKIO_LOG_ERROR(std::string("CurlMultiAttachment: curl_multi_remove_handle failed: ") +
-                       curl_multi_strerror(mc));
+      log_message_noexcept("CurlMultiAttachment: curl_multi_remove_handle failed: ",
+                           curl_multi_strerror(mc));
     }
   }
   _multi = nullptr;
@@ -80,10 +173,8 @@ RemoteMultiTransfer::~RemoteMultiTransfer()
   try {
     PushAndPopContext c(device_ctx);
     BounceBufferCache::instance().recycle_now(device_ctx, std::move(buffer));
-  } catch (std::exception const& e) {
-    KVIKIO_LOG_ERROR(std::string("RemoteMultiTransfer: buffer recycle failed: ") + e.what());
   } catch (...) {
-    KVIKIO_LOG_ERROR("RemoteMultiTransfer: buffer recycle failed: unknown exception");
+    log_failure_noexcept("RemoteMultiTransfer: buffer recycle failed: ", std::current_exception());
   }
 }
 
@@ -165,10 +256,17 @@ MultiPollReactor::MultiPollReactor(MultiReactorPool* pool,
     _pool != nullptr, "MultiPollReactor requires a non-null pool", std::invalid_argument);
   // Force LibCurl global init before we create the multi handle.
   std::ignore = LibCurl::instance();
-  _curl_multi = curl_multi_init();
-  KVIKIO_EXPECT(_curl_multi != nullptr, "curl_multi_init() failed", std::runtime_error);
-  set_connection_cache_size(max_concurrent_requests);
-  _io_thread = std::thread(&MultiPollReactor::io_thread_main, this);
+  try {
+    _curl_multi = curl_multi_init();
+    KVIKIO_EXPECT(_curl_multi != nullptr, "curl_multi_init() failed", std::runtime_error);
+    set_connection_cache_size(max_concurrent_requests);
+  } catch (...) {
+    if (_curl_multi != nullptr) {
+      std::ignore = curl_multi_cleanup(_curl_multi);
+      _curl_multi = nullptr;
+    }
+    throw;
+  }
 }
 
 std::optional<long> connection_cache_size(
@@ -203,32 +301,73 @@ void MultiPollReactor::set_connection_cache_size(
 
 MultiPollReactor::~MultiPollReactor() noexcept
 {
-  // Intentionally empty. Reactors are owned by the leaked `MultiReactorPool` singleton and never
-  // destroyed. This dtor exists only to complete the type for `std::unique_ptr`. Running it would
-  // destroy an unjoined `std::thread` and call `std::terminate()`.
+  // The process-wide pool is intentionally leaked during normal operation, but this destructor is
+  // required when pool construction unwinds after a later reactor fails. Stop and join the thread
+  // before member destruction so resource exhaustion propagates as an exception instead of
+  // std::thread::~thread calling std::terminate.
+  stop();
+  if (_curl_multi != nullptr) {
+    std::ignore = curl_multi_cleanup(_curl_multi);
+    _curl_multi = nullptr;
+  }
+}
+
+void MultiPollReactor::start()
+{
+  KVIKIO_EXPECT(!_io_thread.joinable(), "MultiPollReactor is already started", std::logic_error);
+  _io_thread = std::thread(&MultiPollReactor::io_thread_main, this);
+}
+
+void MultiPollReactor::stop() noexcept
+{
+  _stop.store(true, std::memory_order_release);
+  wakeup();
+  if (_io_thread.joinable()) { _io_thread.join(); }
 }
 
 void MultiPollReactor::wakeup() noexcept { std::ignore = curl_multi_wakeup(_curl_multi); }
 
-void MultiPollReactor::submit(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers)
+void MultiPollReactor::submit(std::vector<std::unique_ptr<RemoteMultiTransfer>> transfers) noexcept
 {
   if (transfers.empty()) { return; }
   std::exception_ptr fail_reason;
-  {
-    std::lock_guard<std::mutex> const lock(_submit_mutex);
-    if (_pool->is_dead()) {
-      // The pool is dead. Fail the batch immediately instead of pushing into an inbox that will
-      // never be drained.
-      fail_reason = _pool->death_reason();
-    } else {
-      for (auto& transfer : transfers) {
-        _inbox.push_back(std::move(transfer));
+  try {
+    {
+      std::lock_guard<std::mutex> const lock(_submit_mutex);
+      if (_pool->is_dead()) {
+        // The pool is dead. Fail the batch immediately instead of pushing into an inbox that will
+        // never be drained.
+        fail_reason = _pool->death_reason();
+      } else {
+        try {
+          for (auto& transfer : transfers) {
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+            maybe_inject_failure(submission_failure_countdown);
+#endif
+            _inbox.push_back(std::move(transfer));
+          }
+        } catch (...) {
+          // Publish pool death while the inbox lock is still held. Otherwise this reactor could
+          // drain a partially inserted batch in the window between releasing the lock and marking
+          // the pool dead.
+          fail_reason = std::current_exception();
+          _pool->signal_death(fail_reason);
+          // Another reactor may have won the race to declare pool death. Every transfer must
+          // observe that first, canonical failure rather than this later local failure.
+          fail_reason = _pool->death_reason();
+        }
       }
     }
+  } catch (...) {
+    // A submit-mutex failure happens before this call can safely publish ownership. Treat it as a
+    // pool failure as well so this noexcept boundary always resolves the caller's future.
+    fail_reason = std::current_exception();
+    _pool->signal_death(fail_reason);
+    fail_reason = _pool->death_reason();
   }
   if (fail_reason) {
     for (auto& transfer : transfers) {
-      transfer->aggregate->on_subrange_failed(fail_reason);
+      if (transfer) { fail_aggregate_transfer(*transfer, fail_reason); }
     }
     return;
   }
@@ -239,20 +378,29 @@ void MultiPollReactor::io_thread_main()
 {
   using BounceBufferCache = BounceBufferCachePerThreadAndContext<CudaPinnedAllocator>;
   try {
-    while (!_pool->is_dead()) {
+    while (!_stop.load(std::memory_order_acquire) && !_pool->is_dead()) {
       // Stage (1): Splice newly submitted transfers out of the inbox (shared by the reactor thread
       // and submission thread) to minimize the lock duration.
+      bool submission_failed_pool{};
       {
-        std::lock_guard<std::mutex> const lock(_submit_mutex);
-        if (_pending.empty()) {
-          std::swap(_pending, _inbox);
-        } else {
-          while (!_inbox.empty()) {
-            _pending.push_back(std::move(_inbox.front()));
-            _inbox.pop_front();
+        // Match MultiReactorPool::submit_pread's lock order. This prevents any reactor from
+        // draining an early PER_CHUNK bucket until every bucket from that pread has been handed off
+        // successfully (or the pool has been marked dead).
+        std::lock_guard<std::mutex> const submission_lock(_pool->_submission_mutex);
+        std::lock_guard<std::mutex> const inbox_lock(_submit_mutex);
+        submission_failed_pool = _pool->is_dead();
+        if (!submission_failed_pool) {
+          if (_pending.empty()) {
+            std::swap(_pending, _inbox);
+          } else {
+            while (!_inbox.empty()) {
+              _pending.push_back(std::move(_inbox.front()));
+              _inbox.pop_front();
+            }
           }
         }
       }
+      if (submission_failed_pool) { break; }
 
       // Iterate the per-reactor _pending: Each entry is either admitted to libcurl or moved to
       // `deferred_transfers`, which becomes the new `_pending` at the end.
@@ -269,6 +417,8 @@ void MultiPollReactor::io_thread_main()
       while (!_pending.empty()) {
         auto transfer = std::move(_pending.front());
         _pending.pop_front();
+        decltype(_in_flight)::iterator in_flight_slot = _in_flight.end();
+        bool in_flight_slot_reserved{};
         try {
           // Defer a transfer if it is still serving its backoff for retry.
           if (transfer->ready_at > walk_start) {
@@ -323,27 +473,45 @@ void MultiPollReactor::io_thread_main()
             transfer->ctx.pinned_buffer = transfer->buffer.get();
           }
 
-          CURL* easy    = transfer->curl->handle();
+          CURL* easy = transfer->curl->handle();
+          // Allocate the ownership node before attaching the easy handle. If allocation or rehash
+          // fails, `transfer` is still locally owned and can be failed with the original exception
+          // instead of being lost as a moved-from argument to unordered_map::emplace.
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+          maybe_inject_failure(admission_failure_countdown);
+#endif
+          auto const insertion = _in_flight.try_emplace(easy, nullptr);
+          KVIKIO_EXPECT(insertion.second,
+                        "MultiPollReactor: duplicate easy handle admission",
+                        std::logic_error);
+          in_flight_slot          = insertion.first;
+          in_flight_slot_reserved = true;
+
           auto const mc = curl_multi_add_handle(_curl_multi, easy);
           if (mc != CURLM_OK) {
-            transfer->aggregate->on_subrange_failed(std::make_exception_ptr(std::runtime_error(
-              std::string("curl_multi_add_handle: ") + curl_multi_strerror(mc))));
-            transfer.reset();
             KVIKIO_FAIL(std::string("curl_multi_add_handle: ") + curl_multi_strerror(mc),
                         std::runtime_error);
           }
-          transfer->attachment = CurlMultiAttachment{_curl_multi, easy};
-          transfer->slot       = std::move(slot);
-          _in_flight.emplace(easy, std::move(transfer));
+          transfer->attachment    = CurlMultiAttachment{_curl_multi, easy};
+          transfer->slot          = std::move(slot);
+          in_flight_slot->second  = std::move(transfer);
+          in_flight_slot_reserved = false;
         } catch (...) {
-          // Requeue the in-hand transfer (unless already failed above) and the already-deferred
-          // entries, so fail_all_pending, which drains `_pending`, resolves their aggregates.
-          if (transfer) { _pending.push_front(std::move(transfer)); }
-          while (!deferred_transfers.empty()) {
-            _pending.push_front(std::move(deferred_transfers.back()));
-            deferred_transfers.pop_back();
+          // Establish (or observe) the pool's canonical first failure before resolving any
+          // aggregate. Otherwise a concurrent reactor could win pool death after these locally
+          // owned transfers had permanently recorded this later exception.
+          _pool->signal_death(std::current_exception());
+          auto const failure = _pool->death_reason();
+          if (in_flight_slot_reserved) { _in_flight.erase(in_flight_slot); }
+
+          // Do not allocate while recovering from an allocation failure. Fail locally owned state
+          // in place; the outer reactor catch declares pool death and fail_all_pending handles the
+          // entries that remain in reactor containers.
+          if (transfer) { fail_aggregate_transfer(*transfer, failure); }
+          for (auto& deferred : deferred_transfers) {
+            if (deferred) { fail_aggregate_transfer(*deferred, failure); }
           }
-          throw;
+          std::rethrow_exception(failure);
         }
       }
       // The walk drained `_pending`. The deferred entries become the new pending queue.
@@ -383,19 +551,39 @@ void MultiPollReactor::io_thread_main()
               // the cache slot is returned when the H2D drains.
               PushAndPopContext c(transfer->device_ctx);
               CUstream stream = StreamCachePerThreadAndContext::get();
-              KVIKIO_CUDA_DRIVER_TRY(
-                cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(transfer->device_dst),
-                                                    transfer->buffer.get(),
-                                                    transfer->ctx.size,
-                                                    stream));
-              transfer->aggregate->io_event_barrier->record_event(stream);
-              BounceBufferCache::instance().recycle_after(transfer->device_ctx,
-                                                          std::move(transfer->buffer),
-                                                          stream,
-                                                          [curl_multi = _curl_multi]() noexcept {
-                                                            std::ignore =
-                                                              curl_multi_wakeup(curl_multi);
-                                                          });
+              bool h2d_may_be_enqueued{false};
+              try {
+                h2d_may_be_enqueued = true;
+                KVIKIO_CUDA_DRIVER_TRY(
+                  cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(transfer->device_dst),
+                                                      transfer->buffer.get(),
+                                                      transfer->ctx.size,
+                                                      stream));
+                transfer->aggregate->io_event_barrier->record_event(stream);
+                BounceBufferCache::instance().recycle_after(transfer->device_ctx,
+                                                            std::move(transfer->buffer),
+                                                            stream,
+                                                            [curl_multi = _curl_multi]() noexcept {
+                                                              std::ignore =
+                                                                curl_multi_wakeup(curl_multi);
+                                                            });
+              } catch (...) {
+                // If event/callback setup failed after an H2D may have been queued and this object
+                // still owns the source slot, drain the stream before normal failure cleanup can
+                // recycle it. recycle_after handles the moved-buffer case internally.
+                if (h2d_may_be_enqueued && transfer->buffer.get() != nullptr) {
+                  try {
+                    KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+                  } catch (...) {
+                    auto const sync_error = std::current_exception();
+                    transfer->aggregate->io_event_barrier->mark_completion_unknown();
+                    BounceBufferCache::instance().abandon_checked_out_after_failed_sync(
+                      transfer->device_ctx, std::move(transfer->buffer));
+                    log_failure_noexcept("H2D failure synchronization failed: ", sync_error);
+                  }
+                }
+                throw;
+              }
             }
             transfer->aggregate->on_subrange_complete(transfer->ctx.size);
           } else if (transfer->ctx.overflow_error) {
@@ -416,7 +604,11 @@ void MultiPollReactor::io_thread_main()
               res, http_code, transfer->attempt, errmsg, "curl_multi transfer failed");
 
             if (outcome.decision == RetryDecision::RETRY) {
-              KVIKIO_LOG_WARN(outcome.message);
+              try {
+                KVIKIO_LOG_WARN(outcome.message);
+              } catch (...) {
+                // Retry diagnostics must not turn an otherwise recoverable request into failure.
+              }
               auto const ready_at = std::chrono::steady_clock::now() + outcome.delay_ms;
               // If a shorter backoff appears
               if (earliest_ready_at.has_value()) {
@@ -433,7 +625,7 @@ void MultiPollReactor::io_thread_main()
         } catch (...) {
           transfer_err = std::current_exception();
         }
-        if (transfer_err) { transfer->aggregate->on_subrange_failed(transfer_err); }
+        if (transfer_err) { fail_aggregate_transfer(*transfer, transfer_err); }
       }
 
       // Stage (4): Wait for socket activity, a wakeup, a timeout, or elapsed backoff for retry.
@@ -472,13 +664,19 @@ void MultiPollReactor::io_thread_main()
                     std::runtime_error);
     }
   } catch (...) {
-    // Any libcurl multi-API error caught above declares pool-wide death. The first reactor to
+    // Any fatal reactor-loop error caught above declares pool-wide death. The first reactor to
     // signal wins. Subsequent signals are silently ignored.
-    KVIKIO_LOG_ERROR("MultiPollReactor: fatal libcurl error, reactor pool declared dead");
-    _pool->signal_death(std::current_exception());
+    auto const failure = std::current_exception();
+    log_failure_noexcept("MultiPollReactor fatal error; reactor pool declared dead: ", failure);
+    _pool->signal_death(failure);
   }
-  // Reached by catching the exception above or by noticing _pool->is_dead() at the loop top. Either
-  // way, drain our own state with the recorded reason so no caller's future.get() hangs.
+  // `_stop` is used only while unwinding pool construction. Such a reactor has never been published
+  // to submit_pread(), hence owns no transfers and has no failure to fan out. In every operational
+  // exit the pool is dead and carries the non-null exception used to resolve callers' futures.
+  if (_stop.load(std::memory_order_acquire) && !_pool->is_dead()) { return; }
+
+  // Reached by catching the exception above or by noticing _pool->is_dead() at the loop top. Drain
+  // our own state with the recorded reason so no caller's future.get() hangs.
   fail_all_pending(_pool->death_reason());
 }
 
@@ -505,7 +703,19 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
     transfer->ready_at = ready_at;
     _pending.push_back(std::move(transfer));
   } catch (...) {
-    aggregate->on_subrange_failed(std::current_exception());
+    auto const failure = std::current_exception();
+    if (transfer) {
+      fail_aggregate_transfer(*transfer, failure);
+    } else {
+      // A successful deque insertion is the final operation in the try block, so this branch is
+      // defensive only. Never let a broken promise or recorder callback escape noexcept.
+      try {
+        aggregate->on_subrange_failed(failure);
+      } catch (...) {
+        log_failure_noexcept("remote retry aggregate failure callback threw: ",
+                             std::current_exception());
+      }
+    }
   }
 }
 
@@ -517,7 +727,7 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
     while (!_inbox.empty()) {
       auto transfer = std::move(_inbox.front());
       _inbox.pop_front();
-      transfer->aggregate->on_subrange_failed(eptr);
+      fail_aggregate_transfer(*transfer, eptr);
     }
   }
 
@@ -525,12 +735,12 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
   while (!_pending.empty()) {
     auto transfer = std::move(_pending.front());
     _pending.pop_front();
-    transfer->aggregate->on_subrange_failed(eptr);
+    fail_aggregate_transfer(*transfer, eptr);
   }
 
   // In-flight is touched only by the I/O thread, which is us, so no lock needed.
   for (auto& in_flight_entry : _in_flight) {
-    in_flight_entry.second->aggregate->on_subrange_failed(eptr);
+    fail_aggregate_transfer(*in_flight_entry.second, eptr);
   }
   _in_flight.clear();
 }
@@ -547,10 +757,29 @@ MultiReactorPool::MultiReactorPool() : _dispatch{defaults::remote_io_reactor_dis
   // Validate the finite global budget before starting any reactor threads.
   std::ignore = reactor_concurrency_limit(max_total, n, 0);
 
+  // Construct and publish the complete immutable reactor set before any reactor thread can report
+  // a fatal error and ask the pool to wake its peers. Starting a thread while building a local
+  // vector would let wakeup_all() race publication of that vector into `_reactors`.
   _reactors.reserve(n);
   for (unsigned int i = 0; i < n; ++i) {
     auto const per_reactor_max = reactor_concurrency_limit(max_total, n, i);
     _reactors.emplace_back(std::make_unique<MultiPollReactor>(this, per_reactor_max));
+  }
+
+  try {
+    for (auto& reactor : _reactors) {
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+      maybe_inject_failure(reactor_construction_failure_countdown);
+#endif
+      reactor->start();
+    }
+  } catch (...) {
+    // Keep the complete vector stable while all successfully started threads stop. A running
+    // reactor may still signal pool death and iterate the vector during this unwind.
+    for (auto& reactor : _reactors) {
+      reactor->stop();
+    }
+    throw;
   }
 }
 
@@ -574,16 +803,22 @@ void MultiReactorPool::submit_pread(std::vector<std::unique_ptr<RemoteMultiTrans
   // PER_PREAD: one reactor for the whole pread() call. Preserves per-CURLM connection-pool reuse.
   if (_dispatch == RemoteReactorDispatch::PER_PREAD) {
     auto const idx = _next_reactor_counter.fetch_add(1, std::memory_order_relaxed) % reactor_count;
+    std::lock_guard<std::mutex> const submission_lock(_submission_mutex);
     _reactors[idx]->submit(std::move(transfers));
     return;
   }
 
-  // PER_CHUNK: round-robin sub-ranges across reactors.
+  // PER_CHUNK: round-robin sub-ranges across reactors. Build the buckets before taking the global
+  // gate so allocation and routing do not stall unrelated reactor inbox drains.
   std::vector<std::vector<std::unique_ptr<RemoteMultiTransfer>>> buckets(reactor_count);
   for (auto& transfer : transfers) {
     auto const idx = _next_reactor_counter.fetch_add(1, std::memory_order_relaxed) % reactor_count;
     buckets[idx].push_back(std::move(transfer));
   }
+
+  // Hold the gate only across handoff. No reactor can drain an early bucket before every later
+  // handoff either succeeds or coherently declares pool death.
+  std::lock_guard<std::mutex> const submission_lock(_submission_mutex);
   for (std::size_t i = 0; i < reactor_count; ++i) {
     if (!buckets[i].empty()) { _reactors[i]->submit(std::move(buckets[i])); }
   }
@@ -614,10 +849,15 @@ void MultiReactorPool::signal_death(std::exception_ptr eptr) noexcept
     _dead.store(true, std::memory_order_release);
   }
 
-  // Wake every reactor out of curl_multi_poll so they notice _dead promptly. Including the caller's
-  // own reactor is harmless, since it has already left its loop.
-  for (auto const& r : _reactors) {
-    r->wakeup();
+  wakeup_all();
+}
+
+void MultiReactorPool::wakeup_all() noexcept
+{
+  // Including a caller's own reactor is harmless. curl_multi_wakeup is explicitly thread-safe and
+  // each reactor retains a bounded poll timeout if a rare wakeup fails.
+  for (auto const& reactor : _reactors) {
+    reactor->wakeup();
   }
 }
 

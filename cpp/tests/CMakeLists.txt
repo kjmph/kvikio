@@ -53,6 +53,7 @@ function(kvikio_add_test)
     PRIVATE kvikio::kvikio GTest::gmock GTest::gmock_main GTest::gtest GTest::gtest_main
             CUDA::cudart_static $<TARGET_NAME_IF_EXISTS:CURL::libcurl>
   )
+  target_compile_definitions(${_KVIKIO_NAME} PRIVATE KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
 
   rapids_test_add(
     NAME ${_KVIKIO_NAME}
@@ -149,6 +150,8 @@ kvikio_add_test(NAME IO_EVENT_BARRIER_TEST SOURCES test_io_event_barrier.cpp)
 
 kvikio_add_test(NAME OBSERVATION_TEST SOURCES test_observation.cpp)
 
+kvikio_add_test(NAME PARALLEL_OPERATION_TEST SOURCES test_parallel_operation.cpp)
+
 kvikio_add_test(NAME SUMMARY_TEST SOURCES test_summary.cpp)
 
 kvikio_add_test(NAME STRING_UTILS_TEST SOURCES test_string_utils.cpp)
@@ -156,6 +159,8 @@ kvikio_add_test(NAME STRING_UTILS_TEST SOURCES test_string_utils.cpp)
 kvikio_add_test(NAME MMAP_TEST SOURCES test_mmap.cpp)
 
 kvikio_add_test(NAME CONCURRENT_REQUEST_LIMITER_TEST SOURCES test_concurrent_request_limiter.cpp)
+
+kvikio_add_test(NAME CUDA_FENCE_TEST SOURCES test_cuda_fence.cpp)
 
 kvikio_add_nsys_plugin_test(
   NAME NIC_MONITOR_TEST SOURCES test_nic_monitor.cpp PLUGIN_SOURCES nic/nic_monitor.cpp
@@ -168,6 +173,18 @@ if(KvikIO_REMOTE_SUPPORT)
   kvikio_add_test(NAME TLS_TEST SOURCES test_tls.cpp utils/env.cpp)
   kvikio_add_test(NAME URL_TEST SOURCES test_url.cpp)
   kvikio_add_test(NAME MULTI_POLL_REACTOR_TEST SOURCES test_multi_poll_reactor.cpp utils/env.cpp)
+  kvikio_add_test(
+    NAME MULTI_POLL_SUBMISSION_FAILURE_TEST SOURCES test_multi_poll_submission_failure.cpp
+  )
+  kvikio_add_test(
+    NAME MULTI_POLL_DISPATCH_FAILURE_TEST SOURCES test_multi_poll_dispatch_failure.cpp
+  )
+  kvikio_add_test(
+    NAME MULTI_POLL_ADMISSION_FAILURE_TEST SOURCES test_multi_poll_admission_failure.cpp
+  )
+  kvikio_add_test(
+    NAME MULTI_POLL_CONSTRUCTION_FAILURE_TEST SOURCES test_multi_poll_construction_failure.cpp
+  )
 endif()
 
 rapids_test_install_relocatable(INSTALL_COMPONENT_SET testing DESTINATION bin/tests/libkvikio)

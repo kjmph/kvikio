@@ -31,6 +31,7 @@ cudaAPI::cudaAPI()
   get_symbol(CtxPushCurrent, lib, KVIKIO_STRINGIFY(cuCtxPushCurrent));
   get_symbol(CtxPopCurrent, lib, KVIKIO_STRINGIFY(cuCtxPopCurrent));
   get_symbol(CtxGetCurrent, lib, KVIKIO_STRINGIFY(cuCtxGetCurrent));
+  get_symbol(CtxSynchronize, lib, KVIKIO_STRINGIFY(cuCtxSynchronize));
   get_symbol(CtxGetDevice, lib, KVIKIO_STRINGIFY(cuCtxGetDevice));
   get_symbol(MemGetAddressRange, lib, KVIKIO_STRINGIFY(cuMemGetAddressRange));
   get_symbol(GetErrorName, lib, KVIKIO_STRINGIFY(cuGetErrorName));

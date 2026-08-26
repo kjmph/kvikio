@@ -14,6 +14,18 @@
 
 namespace kvikio::detail {
 
+namespace {
+
+void log_error_noexcept(char const* message) noexcept
+{
+  try {
+    KVIKIO_LOG_ERROR(message);
+  } catch (...) {
+  }
+}
+
+}  // namespace
+
 CudaEventPool::CudaEvent::CudaEvent(CudaEventPool* pool,
                                     CUevent event,
                                     CUcontext cuda_context) noexcept
@@ -73,6 +85,13 @@ bool CudaEventPool::CudaEvent::is_done() const
   return false;
 }
 
+void CudaEventPool::CudaEvent::abandon() noexcept
+{
+  _pool         = nullptr;
+  _event        = nullptr;
+  _cuda_context = nullptr;
+}
+
 CudaEventPool::CudaEvent CudaEventPool::get()
 {
   KVIKIO_NVTX_FUNC_RANGE();
@@ -111,11 +130,21 @@ void CudaEventPool::put(CUevent event, CUcontext cuda_context) noexcept
   } catch (std::exception const& e) {
     // push_back can throw on allocator failure (e.g., out-of-memory). The event cannot stay
     // cached, so destroy it to release its CUDA resources.
-    KVIKIO_LOG_ERROR(e.what());
+    log_error_noexcept(e.what());
     try {
       KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().EventDestroy(event));
     } catch (std::exception const& e) {
-      KVIKIO_LOG_ERROR(e.what());
+      log_error_noexcept(e.what());
+    } catch (...) {
+      log_error_noexcept("CudaEventPool: unknown error destroying an uncached event");
+    }
+  } catch (...) {
+    // A non-standard mutex or allocator failure must not escape this noexcept destruction path.
+    log_error_noexcept("CudaEventPool: unknown error returning an event to the cache");
+    try {
+      KVIKIO_CUDA_DRIVER_TRY(cudaAPI::instance().EventDestroy(event));
+    } catch (...) {
+      log_error_noexcept("CudaEventPool: unknown error destroying an uncached event");
     }
   }
 }

@@ -150,6 +150,14 @@ class BounceBufferPool {
     void* get() const noexcept;
     void* get(std::ptrdiff_t offset) const noexcept;
     std::size_t size() const noexcept;
+
+    /**
+     * @brief Relinquish RAII ownership without returning the allocation to the pool.
+     *
+     * Used only when CUDA cannot prove that asynchronous users have stopped touching the buffer.
+     * Leaking is safer than recycling storage that DMA may still read.
+     */
+    void* release() noexcept;
   };
 
   BounceBufferPool() = default;

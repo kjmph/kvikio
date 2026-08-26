@@ -97,6 +97,7 @@ class cudaAPI {
   decltype(cuCtxPushCurrent)* CtxPushCurrent{nullptr};
   decltype(cuCtxPopCurrent)* CtxPopCurrent{nullptr};
   decltype(cuCtxGetCurrent)* CtxGetCurrent{nullptr};
+  decltype(cuCtxSynchronize)* CtxSynchronize{nullptr};
   decltype(cuCtxGetDevice)* CtxGetDevice{nullptr};
   decltype(cuMemGetAddressRange)* MemGetAddressRange{nullptr};
   decltype(cuGetErrorName)* GetErrorName{nullptr};
