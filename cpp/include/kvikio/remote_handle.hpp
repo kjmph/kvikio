@@ -33,8 +33,8 @@ enum class RemoteEndpointType : uint8_t {
   AUTO,  ///< Automatically detect the endpoint type from the URL. KvikIO will attempt to infer the
          ///< appropriate protocol based on the URL format.
   S3,    ///< AWS S3 endpoint using credentials-based authentication. Requires AWS environment
-         ///< variables (such as AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION) to be
-         ///< set.
+         ///< variables (such as AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION or
+         ///< AWS_DEFAULT_REGION) to be set.
   S3_PUBLIC,  ///< AWS S3 endpoint for publicly accessible objects. No credentials required as the
               ///< objects have public read permissions enabled. Used for open datasets and public
               ///< buckets.
@@ -188,13 +188,12 @@ class S3Endpoint : public RemoteEndpoint {
   /**
    * @brief Get url from a AWS S3 bucket and object name.
    *
-   * @exception std::invalid_argument if no region is specified and no default region is
-   * specified in the environment.
+   * @exception std::invalid_argument if no region is specified in the argument or environment.
    *
    * @param bucket_name The name of the S3 bucket.
    * @param object_name The name of the S3 object.
    * @param aws_region The AWS region, such as "us-east-1", to use. If nullopt, the value of the
-   * `AWS_DEFAULT_REGION` environment variable is used.
+   * `AWS_REGION` environment variable is used, falling back to `AWS_DEFAULT_REGION`.
    * @param aws_endpoint_url Overwrite the endpoint url (including the protocol part) by using
    * the scheme: "<aws_endpoint_url>/<bucket_name>/<object_name>". If nullopt, the value of the
    * `AWS_ENDPOINT_URL` environment variable is used. If this is also not set, the regular AWS
@@ -222,7 +221,7 @@ class S3Endpoint : public RemoteEndpoint {
    * "http://" or "https://". If you have an S3 url of the form "s3://<bucket>/<object>", please
    * use `S3Endpoint::parse_s3_url()` and `S3Endpoint::url_from_bucket_and_object() to convert it.
    * @param aws_region The AWS region, such as "us-east-1", to use. If nullopt, the value of the
-   * `AWS_DEFAULT_REGION` environment variable is used.
+   * `AWS_REGION` environment variable is used, falling back to `AWS_DEFAULT_REGION`.
    * @param aws_access_key The AWS access key to use. If nullopt, the value of the
    * `AWS_ACCESS_KEY_ID` environment variable is used.
    * @param aws_secret_access_key The AWS secret access key to use. If nullopt, the value of the
@@ -241,7 +240,7 @@ class S3Endpoint : public RemoteEndpoint {
    *
    * @param bucket_and_object_names The bucket and object names of the S3 bucket.
    * @param aws_region The AWS region, such as "us-east-1", to use. If nullopt, the value of the
-   * `AWS_DEFAULT_REGION` environment variable is used.
+   * `AWS_REGION` environment variable is used, falling back to `AWS_DEFAULT_REGION`.
    * @param aws_access_key The AWS access key to use. If nullopt, the value of the
    * `AWS_ACCESS_KEY_ID` environment variable is used.
    * @param aws_secret_access_key The AWS secret access key to use. If nullopt, the value of the
@@ -286,6 +285,16 @@ class S3PublicEndpoint : public RemoteEndpoint {
   std::string _url;
 
  public:
+  /**
+   * @brief Create an anonymous S3 endpoint from an S3 object identifier or AWS HTTP(S) URL.
+   *
+   * An `s3://<bucket>/<object>` identifier is converted to a regional HTTPS virtual-host URL (or
+   * the configured `AWS_ENDPOINT_URL`) before it is passed to libcurl. HTTP(S) URLs are retained
+   * unchanged. `AWS_REGION` or `AWS_DEFAULT_REGION` is required when no custom endpoint is
+   * configured.
+   *
+   * @param url The S3 object identifier or full AWS S3 HTTP(S) URL.
+   */
   explicit S3PublicEndpoint(std::string url);
 
   ~S3PublicEndpoint() override = default;

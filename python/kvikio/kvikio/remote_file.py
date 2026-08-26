@@ -27,7 +27,7 @@ class RemoteEndpointType(enum.Enum):
     S3 : int
         AWS S3 endpoint using credentials-based authentication. Requires
         AWS environment variables (such as AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-        AWS_DEFAULT_REGION) to be set.
+        and AWS_REGION or AWS_DEFAULT_REGION) to be set.
     S3_PUBLIC : INT
         AWS S3 endpoint for publicly accessible objects. No credentials required as the
         objects have public read permissions enabled. Used for open datasets and public
@@ -142,11 +142,11 @@ class RemoteFile:
         AWS credentials can be provided as keyword arguments or through
         environment variables:
 
-        - ``AWS_DEFAULT_REGION`` (or region_name parameter)
+        - ``AWS_REGION``, falling back to ``AWS_DEFAULT_REGION``
+          (or region_name parameter)
         - ``AWS_ACCESS_KEY_ID`` (or access_key_id parameter)
         - ``AWS_SECRET_ACCESS_KEY`` (or secret_access_key parameter)
-        - ``AWS_SESSION_TOKEN`` (or aws_session_token parameter, when using
-          temporary credentials)
+        - ``AWS_SESSION_TOKEN`` (or aws_session_token parameter)
 
         Additionally, to overwrite the AWS endpoint, set `AWS_ENDPOINT_URL`
         (or endpoint_url parameter).
@@ -163,7 +163,8 @@ class RemoteFile:
             for the file size.
         aws_region
             The AWS region, such as "us-east-1", to use. If None, the value of the
-            `AWS_DEFAULT_REGION` environment variable is used.
+            `AWS_REGION` environment variable is used, falling back to
+            `AWS_DEFAULT_REGION`.
         aws_access_key
             The AWS access key to use. If None, the value of the
             `AWS_ACCESS_KEY_ID` environment variable is used.
@@ -213,11 +214,11 @@ class RemoteFile:
         AWS credentials can be provided as keyword arguments or through
         environment variables:
 
-        - ``AWS_DEFAULT_REGION`` (or region_name parameter)
+        - ``AWS_REGION``, falling back to ``AWS_DEFAULT_REGION``
+          (or region_name parameter)
         - ``AWS_ACCESS_KEY_ID`` (or access_key_id parameter)
         - ``AWS_SECRET_ACCESS_KEY`` (or secret_access_key parameter)
-        - ``AWS_SESSION_TOKEN`` (or aws_session_token parameter, when using
-          temporary credentials)
+        - ``AWS_SESSION_TOKEN`` (or aws_session_token parameter)
 
         Additionally, if `url` is a S3 url, it is possible to overwrite the AWS endpoint
         by setting `AWS_ENDPOINT_URL` (or endpoint_url parameter).
@@ -232,7 +233,8 @@ class RemoteFile:
             for the file size.
         aws_region
             The AWS region, such as "us-east-1", to use. If None, the value of the
-            `AWS_DEFAULT_REGION` environment variable is used.
+            `AWS_REGION` environment variable is used, falling back to
+            `AWS_DEFAULT_REGION`.
         aws_access_key
             The AWS access key to use. If None, the value of the
             `AWS_ACCESS_KEY_ID` environment variable is used.
@@ -279,10 +281,15 @@ class RemoteFile:
     def open_s3_public(cls, url: str, nbytes: Optional[int] = None) -> RemoteFile:
         """Open a publicly accessible AWS S3 file.
 
+        The URL may be a full HTTP(S) URL or an ``s3://<bucket>/<object>``
+        identifier. KvikIO converts the latter to an unsigned transport URL
+        using ``AWS_REGION`` (falling back to ``AWS_DEFAULT_REGION``), unless
+        ``AWS_ENDPOINT_URL`` selects a custom endpoint.
+
         Parameters
         ----------
         url
-             URL to the remote file.
+            HTTP(S) URL or S3 object identifier for the remote file.
         nbytes
             The size of the file. If None, KvikIO will ask the server
             for the file size.

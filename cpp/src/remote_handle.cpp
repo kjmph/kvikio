@@ -253,6 +253,35 @@ std::string encode_special_chars_in_path(std::string const& url)
   return detail::UrlBuilder::build_manually(components);
 }
 
+/**
+ * @brief Convert KvikIO's S3 object notation into a URL libcurl can transfer anonymously.
+ *
+ * `s3://` is an object identifier rather than a protocol understood by libcurl. Credentialed S3
+ * endpoints already translate it while constructing their region-specific signed URL. Public S3
+ * endpoints need the corresponding unsigned transport URL before their first HEAD or range
+ * request. Reuse the credentialed endpoint's regional/custom-endpoint URL construction rather than
+ * guessing the legacy global endpoint, which is not valid for every AWS Region.
+ */
+std::string normalize_public_s3_url(std::string url)
+{
+  auto const scheme =
+    detail::UrlParser::extract_component(url, CURLUPART_SCHEME, CURLU_NON_SUPPORT_SCHEME);
+  if (scheme != "s3") { return url; }
+
+  auto [bucket, object] = S3Endpoint::parse_s3_url(url);
+  return S3Endpoint::url_from_bucket_and_object(
+    std::move(bucket), std::move(object), std::nullopt, std::nullopt);
+}
+
+std::optional<std::string> resolve_aws_region(std::optional<std::string> aws_region,
+                                              std::string const& error_message)
+{
+  if (aws_region.has_value()) { return aws_region; }
+  auto region = detail::unwrap_or_env(std::nullopt, "AWS_REGION");
+  if (region.has_value()) { return region; }
+  return detail::unwrap_or_env(std::nullopt, "AWS_DEFAULT_REGION", error_message);
+}
+
 std::vector<RemoteEndpointType> const& get_default_allow_list()
 {
   static std::vector const res{RemoteEndpointType::S3,
@@ -394,10 +423,9 @@ std::string S3Endpoint::url_from_bucket_and_object(std::string bucket_name,
   auto const endpoint_url = detail::unwrap_or_env(std::move(aws_endpoint_url), "AWS_ENDPOINT_URL");
   std::stringstream ss;
   if (!endpoint_url.has_value()) {
-    auto const region =
-      detail::unwrap_or_env(std::move(aws_region),
-                            "AWS_DEFAULT_REGION",
-                            "S3: must provide `aws_region` if AWS_DEFAULT_REGION isn't set.");
+    auto const region = resolve_aws_region(
+      std::move(aws_region),
+      "S3: must provide `aws_region` if AWS_REGION and AWS_DEFAULT_REGION aren't set.");
     // "s3" is a non-standard URI scheme used by AWS CLI and AWS SDK, and cannot be identified by
     // libcurl. A valid HTTP/HTTPS URL needs to be constructed for use in libcurl. Here the AWS
     // virtual host style is used.
@@ -432,10 +460,9 @@ S3Endpoint::S3Endpoint(std::string url,
                 "url must start with http:// or https://",
                 std::invalid_argument);
 
-  auto const region =
-    detail::unwrap_or_env(std::move(aws_region),
-                          "AWS_DEFAULT_REGION",
-                          "S3: must provide `aws_region` if AWS_DEFAULT_REGION isn't set.");
+  auto const region = resolve_aws_region(
+    std::move(aws_region),
+    "S3: must provide `aws_region` if AWS_REGION and AWS_DEFAULT_REGION aren't set.");
 
   auto const access_key =
     detail::unwrap_or_env(std::move(aws_access_key),
@@ -462,16 +489,20 @@ S3Endpoint::S3Endpoint(std::string url,
     ss << access_key.value() << ":" << secret_access_key.value();
     _aws_userpwd = ss.str();
   }
+  auto const session_token =
+    detail::unwrap_or_env(std::move(aws_session_token), "AWS_SESSION_TOKEN");
   // Access key IDs beginning with ASIA are temporary credentials that are created using AWS STS
-  // operations. They need a session token to work.
+  // operations. They require a session token. Other credential providers and S3-compatible stores
+  // may use a different key prefix, so forward any explicitly supplied token as well.
   if (access_key->compare(0, 4, std::string("ASIA")) == 0) {
+    KVIKIO_EXPECT(session_token.has_value(),
+                  "When using temporary credentials, AWS_SESSION_TOKEN must be set.",
+                  std::invalid_argument);
+  }
+  if (session_token.has_value()) {
     // Create a Custom Curl header for the session token.
     // The _curl_header_list created by curl_slist_append must be manually freed
     // (see https://curl.se/libcurl/c/CURLOPT_HTTPHEADER.html)
-    auto session_token =
-      detail::unwrap_or_env(std::move(aws_session_token),
-                            "AWS_SESSION_TOKEN",
-                            "When using temporary credentials, AWS_SESSION_TOKEN must be set.");
     std::stringstream ss;
     ss << "x-amz-security-token: " << session_token.value();
     _curl_header_list = curl_slist_append(NULL, ss.str().c_str());
@@ -536,7 +567,7 @@ bool S3Endpoint::is_url_valid(std::string const& url) noexcept
 }
 
 S3PublicEndpoint::S3PublicEndpoint(std::string url)
-  : RemoteEndpoint{RemoteEndpointType::S3_PUBLIC}, _url{std::move(url)}
+  : RemoteEndpoint{RemoteEndpointType::S3_PUBLIC}, _url{normalize_public_s3_url(std::move(url))}
 {
 }
 

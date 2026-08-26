@@ -3,24 +3,129 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cerrno>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <curl/curl.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <kvikio/hdfs.hpp>
 #include <kvikio/remote_handle.hpp>
+#include <kvikio/shim/libcurl.hpp>
 
 #include "utils/env.hpp"
 
 using ::testing::HasSubstr;
 using ::testing::ThrowsMessage;
+
+namespace {
+
+class OneRequestHttpServer {
+ public:
+  OneRequestHttpServer()
+  {
+    _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (_listen_fd < 0) { throw std::runtime_error(std::strerror(errno)); }
+
+    int reuse = 1;
+    if (::setsockopt(_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+      auto const message = std::string{std::strerror(errno)};
+      ::close(_listen_fd);
+      _listen_fd = -1;
+      throw std::runtime_error(message);
+    }
+
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port        = 0;
+    if (::bind(_listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::listen(_listen_fd, 1) != 0) {
+      auto const message = std::string{std::strerror(errno)};
+      ::close(_listen_fd);
+      _listen_fd = -1;
+      throw std::runtime_error(message);
+    }
+
+    socklen_t address_length = sizeof(address);
+    if (::getsockname(_listen_fd, reinterpret_cast<sockaddr*>(&address), &address_length) != 0) {
+      auto const message = std::string{std::strerror(errno)};
+      ::close(_listen_fd);
+      _listen_fd = -1;
+      throw std::runtime_error(message);
+    }
+    _port   = ntohs(address.sin_port);
+    _thread = std::thread{[this] { serve(); }};
+  }
+
+  ~OneRequestHttpServer()
+  {
+    if (_listen_fd >= 0) {
+      ::shutdown(_listen_fd, SHUT_RDWR);
+      ::close(_listen_fd);
+      _listen_fd = -1;
+    }
+    if (_thread.joinable()) { _thread.join(); }
+  }
+
+  [[nodiscard]] uint16_t port() const noexcept { return _port; }
+
+  [[nodiscard]] std::string const& request()
+  {
+    if (_thread.joinable()) { _thread.join(); }
+    return _request;
+  }
+
+ private:
+  static bool send_all(int fd, char const* data, std::size_t size)
+  {
+    while (size != 0) {
+      auto const sent = ::send(fd, data, size, MSG_NOSIGNAL);
+      if (sent <= 0) { return false; }
+      data += sent;
+      size -= static_cast<std::size_t>(sent);
+    }
+    return true;
+  }
+
+  void serve()
+  {
+    auto const client = ::accept(_listen_fd, nullptr, nullptr);
+    if (client < 0) { return; }
+
+    char buffer[4096];
+    while (_request.find("\r\n\r\n") == std::string::npos) {
+      auto const received = ::recv(client, buffer, sizeof(buffer), 0);
+      if (received <= 0) { break; }
+      _request.append(buffer, static_cast<std::size_t>(received));
+    }
+
+    constexpr char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    std::ignore               = send_all(client, response, sizeof(response) - 1);
+    ::shutdown(client, SHUT_RDWR);
+    ::close(client);
+  }
+
+  int _listen_fd = -1;
+  uint16_t _port = 0;
+  std::thread _thread;
+  std::string _request;
+};
+
+}  // namespace
 
 class CountingEndpoint : public kvikio::RemoteEndpoint {
  public:
@@ -147,6 +252,26 @@ TEST_F(RemoteHandleTest, s3_endpoint_constructor)
   EXPECT_EQ(s1.str(), s2.str());
 }
 
+TEST_F(RemoteHandleTest, s3_endpoint_forwards_explicit_session_token_for_non_sts_key)
+{
+  OneRequestHttpServer server;
+  auto const url = "http://127.0.0.1:" + std::to_string(server.port()) + "/object";
+  kvikio::S3Endpoint endpoint(
+    url, "us-east-1", "CUSTOMACCESSKEY", "secret-access-key", "explicit-session-token");
+
+  auto curl = create_curl_handle();
+  endpoint.setopt(curl);
+  curl.setopt(CURLOPT_NOBODY, 1L);
+  curl.setopt(CURLOPT_PROXY, "");
+  curl.perform();
+
+  auto const& request = server.request();
+  std::string const expected{"x-amz-security-token: explicit-session-token\r\n"};
+  auto const first = request.find(expected);
+  ASSERT_NE(first, std::string::npos) << request;
+  EXPECT_EQ(request.find(expected, first + expected.size()), std::string::npos) << request;
+}
+
 TEST_F(RemoteHandleTest, test_http_url)
 {
   // Invalid URLs
@@ -191,12 +316,35 @@ TEST_F(RemoteHandleTest, read_overflowing_range_throws_without_range_request)
 
 TEST_F(RemoteHandleTest, test_s3_url)
 {
-  kvikio::test::EnvVarContext env_var_ctx{{"AWS_DEFAULT_REGION", "my_aws_default_region"},
+  kvikio::test::EnvVarContext env_var_ctx{{"AWS_REGION", "my_aws_default_region"},
+                                          {"AWS_DEFAULT_REGION", "my_aws_default_region"},
                                           {"AWS_ACCESS_KEY_ID", "my_aws_access_key_id"},
                                           {"AWS_SECRET_ACCESS_KEY", "my_aws_secrete_access_key"}};
 
   {
     test_helper(kvikio::RemoteEndpointType::S3_PUBLIC, kvikio::S3Endpoint::is_url_valid);
+  }
+
+  // AWS_REGION is the standard SDK setting and takes precedence over the legacy
+  // AWS_DEFAULT_REGION fallback when no explicit region argument is supplied.
+  {
+    kvikio::test::EnvVarContext region_env{{"AWS_REGION", "preferred_region"},
+                                           {"AWS_DEFAULT_REGION", "fallback_region"}};
+    EXPECT_EQ(kvikio::S3Endpoint::url_from_bucket_and_object(
+                "bucket-name", "object-key-name", std::nullopt, std::nullopt),
+              "https://bucket-name.s3.preferred_region.amazonaws.com/object-key-name");
+  }
+
+  // Public S3 accepts the object-store notation at its API boundary, but libcurl must receive an
+  // HTTP(S) transport URL. Supplying nbytes avoids network access while still exposing the endpoint
+  // selected by RemoteHandle::open().
+  {
+    auto remote_handle = kvikio::RemoteHandle::open("s3://bucket-name/path/to/object-key-name",
+                                                    kvikio::RemoteEndpointType::S3_PUBLIC,
+                                                    std::nullopt,
+                                                    1);
+    EXPECT_EQ(remote_handle.endpoint().str(),
+              "https://bucket-name.s3.my_aws_default_region.amazonaws.com/path/to/object-key-name");
   }
 
   // Invalid URLs
