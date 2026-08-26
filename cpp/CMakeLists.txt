@@ -206,11 +206,23 @@ endif()
 
 add_library(kvikio ${SOURCES})
 
-# To avoid symbol conflicts when statically linking to libcurl.a (see get_libcurl.cmake) and its
-# dependency OpenSSL, we exclude them when building libkvikio.so. This way, libkvikio.so will not
-# expose any OpenSSL symbols that could conflict with downstream users like CPython that also links
-# to (another version of) OpenSSL.
-target_link_options(kvikio PRIVATE "LINKER:--exclude-libs,ALL")
+# Avoid exporting private archive symbols from a shared object. A PRIVATE link option works while
+# producing libkvikio.so, but has no link step to affect when KvikIO itself is an archive. In that
+# case, propagate an ELF-only exclusion for the exact libcurl archive name so an embedding shared
+# library does not export or interpose KvikIO's private curl ABI. Keep KvikIO's own public symbols
+# visible; an embedding consumer may choose a stricter policy for those separately.
+get_target_property(_kvikio_library_type kvikio TYPE)
+if(_kvikio_library_type STREQUAL "STATIC_LIBRARY")
+  if(KvikIO_REMOTE_SUPPORT)
+    target_link_options(
+      kvikio
+      INTERFACE
+        "$<$<AND:$<PLATFORM_ID:Linux>,$<TARGET_EXISTS:CURL::libcurl>>:LINKER:--exclude-libs,$<TARGET_FILE_NAME:CURL::libcurl>>"
+    )
+  endif()
+else()
+  target_link_options(kvikio PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
 
 add_library(kvikio::kvikio ALIAS kvikio)
 
