@@ -16,8 +16,8 @@ namespace kvikio::detail {
  * Used by the `MULTI_POLL` remote I/O backend to cap the number of HTTP range requests that a
  * reactor keeps simultaneously attached to its multi handle. Without such a bound, one `pread()`
  * of a large file may submit too many requests which overwhelms the network. Each reactor owns its
- * own limiter, sized to a private share of the global budget
- * (`KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS / num_reactors`).
+ * own limiter, sized to a private share of the global budget. The budget is divided by quotient
+ * and remainder so the private shares sum to `KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS` exactly.
  *
  * The limiter does not block. A caller that cannot acquire a slot is expected to defer its work
  * and retry later, so the reactor thread is free to keep driving the requests it already admitted.

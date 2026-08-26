@@ -20,6 +20,23 @@
 namespace kvikio::detail {
 
 /**
+ * @brief Compute the private bounce-buffer cache cap for one reactor-owned shard.
+ *
+ * A zero total means unlimited. A finite total must be at least the reactor count. The returned
+ * ceiling share is large enough for the busiest reactor when the process-wide request budget is
+ * divided exactly across reactors. Request admission still enforces the exact process-wide budget;
+ * this value only bounds buffers retained by an individual cache shard.
+ *
+ * @param max_total Process-wide maximum concurrent request count, or zero for unlimited.
+ * @param num_reactors Number of reactors sharing the request budget.
+ * @return The per-shard cache cap, or `std::nullopt` for unlimited concurrency.
+ * @throws std::invalid_argument if the reactor count is zero or a finite budget is smaller than
+ * the reactor count.
+ */
+[[nodiscard]] KVIKIO_EXPORT std::optional<std::size_t> bounce_buffer_cache_shard_limit(
+  std::size_t max_total, std::size_t num_reactors);
+
+/**
  * @brief Per-(thread, CUDA context) cache of bounce buffers with async recycling.
  *
  * Each key of `(std::thread::id, CUcontext)` tracks three counts that together are capped at
@@ -78,11 +95,12 @@ class BounceBufferCachePerThreadAndContext {
   /**
    * @brief Get the process-wide singleton instance.
    *
-   * The instance is constructed lazily on first call with the per-reactor cap derived from
-   * `defaults::remote_io_max_concurrent_requests()` divided by
-   * `defaults::remote_io_num_reactors()`, giving device transfers the same per-reactor budget as
-   * host transfers. The singleton is intentionally heap-allocated and never deleted. Each template
-   * instantiation (different `Allocator`) has its own singleton.
+   * The instance is constructed lazily on first call with the ceiling of the process-wide request
+   * budget divided by the reactor count. This is large enough for the busiest reactor after an
+   * exact quotient/remainder split. Request admission, rather than this retained-buffer cache,
+   * enforces the exact process-wide concurrency limit. The singleton is intentionally
+   * heap-allocated and never deleted. Each template instantiation (different `Allocator`) has its
+   * own singleton.
    *
    * @return Reference to the singleton instance.
    */

@@ -35,6 +35,24 @@ class MultiReactorPool;  // Forward declaration, because reactors needs to hold 
                          // the pool.
 
 /**
+ * @brief Compute one reactor's exact private share of the process-wide concurrency budget.
+ *
+ * A zero total means unlimited. A finite total must be at least the reactor count so every reactor
+ * can admit work. Any remainder is assigned one request at a time to the lowest reactor indexes;
+ * summing all returned shares therefore equals @p max_total exactly.
+ *
+ * @param max_total Process-wide maximum concurrent request count, or zero for unlimited.
+ * @param num_reactors Number of reactors sharing the budget.
+ * @param reactor_index Zero-based index of the reactor whose share is requested.
+ * @return This reactor's finite private share, or `std::nullopt` for unlimited concurrency.
+ * @throws std::invalid_argument if the reactor count/index is invalid or a finite budget is smaller
+ * than the reactor count.
+ */
+[[nodiscard]] std::optional<std::size_t> reactor_concurrency_limit(std::size_t max_total,
+                                                                   std::size_t num_reactors,
+                                                                   std::size_t reactor_index);
+
+/**
  * @brief Given the max concurrent request cap for a reactor, derive the size of the libcurl
  * connection cache (`CURLMOPT_MAXCONNECTS`).
  *

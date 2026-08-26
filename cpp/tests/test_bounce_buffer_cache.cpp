@@ -265,10 +265,9 @@ TEST_F(BounceBufferCacheTest, singleton_instance_has_default_cap)
 {
   auto& s =
     kvikio::detail::BounceBufferCachePerThreadAndContext<kvikio::CudaPinnedAllocator>::instance();
-  auto const max_total = kvikio::defaults::remote_io_max_concurrent_requests();
-  auto const n         = kvikio::defaults::remote_io_num_reactors();
-  std::optional<std::size_t> const expected_cap =
-    (max_total == 0) ? std::nullopt : std::optional{std::max<std::size_t>(max_total / n, 1)};
+  auto const max_total    = kvikio::defaults::remote_io_max_concurrent_requests();
+  auto const n            = kvikio::defaults::remote_io_num_reactors();
+  auto const expected_cap = kvikio::detail::bounce_buffer_cache_shard_limit(max_total, n);
   EXPECT_EQ(s.cap(), expected_cap);
 
   // try_get on the singleton works.
@@ -276,4 +275,24 @@ TEST_F(BounceBufferCacheTest, singleton_instance_has_default_cap)
   EXPECT_TRUE(b.has_value());
   EXPECT_NE(b->get(), nullptr);
   s.recycle_now(current_context(), std::move(*b));
+}
+
+TEST(BounceBufferCacheShardLimitTest, unlimited)
+{
+  EXPECT_FALSE(kvikio::detail::bounce_buffer_cache_shard_limit(0, 16).has_value());
+}
+
+TEST(BounceBufferCacheShardLimitTest, rounds_up_to_busiest_reactor)
+{
+  EXPECT_EQ(kvikio::detail::bounce_buffer_cache_shard_limit(16, 16), 1);
+  EXPECT_EQ(kvikio::detail::bounce_buffer_cache_shard_limit(192, 16), 12);
+  EXPECT_EQ(kvikio::detail::bounce_buffer_cache_shard_limit(193, 16), 13);
+  EXPECT_EQ(kvikio::detail::bounce_buffer_cache_shard_limit(195, 16), 13);
+}
+
+TEST(BounceBufferCacheShardLimitTest, rejects_invalid_configuration)
+{
+  EXPECT_THROW((void)kvikio::detail::bounce_buffer_cache_shard_limit(0, 0), std::invalid_argument);
+  EXPECT_THROW((void)kvikio::detail::bounce_buffer_cache_shard_limit(16, 0), std::invalid_argument);
+  EXPECT_THROW((void)kvikio::detail::bounce_buffer_cache_shard_limit(1, 16), std::invalid_argument);
 }

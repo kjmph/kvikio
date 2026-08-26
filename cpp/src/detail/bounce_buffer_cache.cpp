@@ -21,6 +21,20 @@
 
 namespace kvikio::detail {
 
+std::optional<std::size_t> bounce_buffer_cache_shard_limit(std::size_t max_total,
+                                                           std::size_t num_reactors)
+{
+  KVIKIO_EXPECT(
+    num_reactors > 0, "remote_io_num_reactors must be a positive integer", std::invalid_argument);
+  if (max_total == 0) { return std::nullopt; }
+  KVIKIO_EXPECT(max_total >= num_reactors,
+                "remote_io_max_concurrent_requests must be zero (unlimited) or at least "
+                "remote_io_num_reactors",
+                std::invalid_argument);
+
+  return max_total / num_reactors + static_cast<std::size_t>(max_total % num_reactors != 0);
+}
+
 template <typename Allocator>
 BounceBufferCachePerThreadAndContext<Allocator>::Shard::Shard(std::optional<std::size_t> cap)
 {
@@ -172,9 +186,7 @@ BounceBufferCachePerThreadAndContext<Allocator>::instance()
   static auto* _instance = []() {
     auto const max_total = defaults::remote_io_max_concurrent_requests();
     auto const n         = defaults::remote_io_num_reactors();
-    std::optional<std::size_t> const per_reactor_max =
-      (max_total == 0) ? std::nullopt : std::optional{std::max<std::size_t>(max_total / n, 1)};
-    return new BounceBufferCachePerThreadAndContext(per_reactor_max);
+    return new BounceBufferCachePerThreadAndContext(bounce_buffer_cache_shard_limit(max_total, n));
   }();
   return *_instance;
 }

@@ -137,6 +137,26 @@ void RemoteMultiAggregateContext::on_subrange_failed(std::exception_ptr eptr)
 
 std::future<std::size_t> RemoteMultiAggregateContext::get_future() { return _promise.get_future(); }
 
+std::optional<std::size_t> reactor_concurrency_limit(std::size_t max_total,
+                                                     std::size_t num_reactors,
+                                                     std::size_t reactor_index)
+{
+  KVIKIO_EXPECT(
+    num_reactors > 0, "remote_io_num_reactors must be a positive integer", std::invalid_argument);
+  KVIKIO_EXPECT(reactor_index < num_reactors,
+                "reactor index must be smaller than remote_io_num_reactors",
+                std::invalid_argument);
+  if (max_total == 0) { return std::nullopt; }
+  KVIKIO_EXPECT(max_total >= num_reactors,
+                "remote_io_max_concurrent_requests must be zero (unlimited) or at least "
+                "remote_io_num_reactors",
+                std::invalid_argument);
+
+  auto const base      = max_total / num_reactors;
+  auto const remainder = max_total % num_reactors;
+  return base + static_cast<std::size_t>(reactor_index < remainder);
+}
+
 MultiPollReactor::MultiPollReactor(MultiReactorPool* pool,
                                    std::optional<std::size_t> max_concurrent_requests)
   : _pool{pool}, _request_limiter{max_concurrent_requests}
@@ -524,11 +544,12 @@ MultiReactorPool::MultiReactorPool() : _dispatch{defaults::remote_io_reactor_dis
   KVIKIO_EXPECT(n > 0, "remote_io_num_reactors must be a positive integer", std::invalid_argument);
 
   auto const max_total = defaults::remote_io_max_concurrent_requests();
-  std::optional<std::size_t> const per_reactor_max =
-    (max_total == 0) ? std::nullopt : std::optional{std::max<std::size_t>(max_total / n, 1)};
+  // Validate the finite global budget before starting any reactor threads.
+  std::ignore = reactor_concurrency_limit(max_total, n, 0);
 
   _reactors.reserve(n);
   for (unsigned int i = 0; i < n; ++i) {
+    auto const per_reactor_max = reactor_concurrency_limit(max_total, n, i);
     _reactors.emplace_back(std::make_unique<MultiPollReactor>(this, per_reactor_max));
   }
 }

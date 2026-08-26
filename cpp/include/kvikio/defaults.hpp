@@ -508,9 +508,10 @@ class defaults {
    * each). This bounds how many of them are attached to the reactors' multi handles at once, summed
    * across all reactor threads.
    *
-   * The budget is divided into an equal private share per reactor, so the effective total is
-   * approximate: it rounds down when the value is not a multiple of the reactor count, and up when
-   * it is smaller than the reactor count (each reactor is floored to at least 1).
+   * The budget is divided into private per-reactor shares. Any remainder is distributed across the
+   * lowest reactor indexes, so the effective process-wide total equals the configured value
+   * exactly. A finite value must be at least the configured reactor count so every reactor can
+   * admit work.
    *
    * Controlled by `KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS`. Must be a non-negative integer. 0
    * means unlimited. Defaults to 256. Ignored when the active backend is not `MULTI_POLL`

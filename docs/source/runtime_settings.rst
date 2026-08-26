@@ -97,9 +97,9 @@ Controls how the sub-ranges of a single :py:func:`kvikio.RemoteFile.pread` are d
 Remote I/O Concurrency Cap ``KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS``
 -----------------------------------------------------------------------
 
-Upper bound on the number of HTTP range requests the ``MULTI_POLL`` backend keeps in flight at once, summed across all reactor threads. The default value is ``256``. It must be a non-negative integer, and ``0`` means unlimited. The value is ignored when the active backend is not ``MULTI_POLL`` (``EASY_THREADPOOL`` is already bounded by ``KVIKIO_NTHREADS``).
+Upper bound on the number of HTTP range requests the ``MULTI_POLL`` backend keeps in flight at once, summed across all reactor threads. The default value is ``256``. It must be a non-negative integer, and ``0`` means unlimited. A nonzero value must be at least ``KVIKIO_REMOTE_IO_NUM_REACTORS`` so every reactor can admit work. The value is ignored when the active backend is not ``MULTI_POLL`` (``EASY_THREADPOOL`` is already bounded by ``KVIKIO_NTHREADS``).
 
-The global budget is divided into an equal private share per reactor (``KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS`` divided by ``KVIKIO_REMOTE_IO_NUM_REACTORS``), so each reactor enforces its own cap against its own inbox with no cross-reactor synchronization. Integer division rounds the per-reactor share down when the budget is not a multiple of the reactor count, and a floor of 1 rounds it up when the budget is smaller than the reactor count (a computed share of 0 would be a reactor that can never admit a request). The effective total is therefore only approximate.
+The global budget is divided into a private share per reactor, so each reactor enforces its own cap against its own inbox with no cross-reactor synchronization. Integer division establishes the base share and any remainder is distributed one request at a time across the lowest reactor indexes. The private shares therefore sum to the exact configured process-wide cap.
 
 The even split assumes sub-ranges are spread across reactors, which holds under ``PER_CHUNK``. Under ``PER_PREAD`` all sub-ranges of one large :py:func:`kvikio.RemoteFile.pread` land on a single reactor, so that read is effectively limited to one reactor's share while the others stay idle.
 

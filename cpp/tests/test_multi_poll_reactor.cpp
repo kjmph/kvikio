@@ -137,3 +137,34 @@ TEST(ConnectionCacheSize, never_exceeds_what_libcurl_accepts)
     EXPECT_GT(size.value(), 0L) << "ceiling: " << ceiling;
   }
 }
+
+TEST(ReactorConcurrencyLimit, unlimited_budget_stays_unlimited)
+{
+  for (std::size_t i = 0; i < 16; ++i) {
+    EXPECT_FALSE(kvikio::detail::reactor_concurrency_limit(0, 16, i).has_value());
+  }
+}
+
+TEST(ReactorConcurrencyLimit, distributes_the_exact_finite_budget)
+{
+  constexpr std::size_t num_reactors = 16;
+  for (auto const max_total : std::array<std::size_t, 4>{16, 192, 193, 195}) {
+    std::size_t distributed{};
+    for (std::size_t i = 0; i < num_reactors; ++i) {
+      auto const share = kvikio::detail::reactor_concurrency_limit(max_total, num_reactors, i);
+      ASSERT_TRUE(share.has_value());
+      EXPECT_EQ(share.value(),
+                max_total / num_reactors + static_cast<std::size_t>(i < max_total % num_reactors));
+      distributed += share.value();
+    }
+    EXPECT_EQ(distributed, max_total);
+  }
+}
+
+TEST(ReactorConcurrencyLimit, rejects_an_unserviceable_or_invalid_configuration)
+{
+  EXPECT_THROW((void)kvikio::detail::reactor_concurrency_limit(1, 16, 0), std::invalid_argument);
+  EXPECT_THROW((void)kvikio::detail::reactor_concurrency_limit(0, 0, 0), std::invalid_argument);
+  EXPECT_THROW((void)kvikio::detail::reactor_concurrency_limit(16, 0, 0), std::invalid_argument);
+  EXPECT_THROW((void)kvikio::detail::reactor_concurrency_limit(16, 16, 16), std::invalid_argument);
+}
