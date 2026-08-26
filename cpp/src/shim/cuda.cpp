@@ -10,6 +10,17 @@
 
 namespace kvikio {
 
+namespace {
+
+#if CUDA_VERSION >= 12080
+bool supports_memcpy_batch(CUstream stream)
+{
+  return cudaAPI::instance().MemcpyBatchAsync && stream != nullptr && stream != CU_STREAM_LEGACY;
+}
+#endif
+
+}  // namespace
+
 cudaAPI::cudaAPI()
 {
   void* lib = load_library("libcuda.so.1");
@@ -61,11 +72,9 @@ cudaAPI::cudaAPI()
     get_symbol(fp, lib, KVIKIO_STRINGIFY(cuMemcpyBatchAsync));
     MemcpyBatchAsync.set(fp);
   } catch (std::runtime_error const&) {
-    // Rethrow the exception if the CUDA driver version at runtime is satisfied but
-    // cuMemcpyBatchAsync is not found.
-    if (driver_version >= 12080) { throw; }
-    // If the CUDA driver version at runtime is not satisfied, reset the wrapper. At the call site,
-    // use the conventional cuMemcpyXtoXAsync API as the fallback.
+    // Batch copies are an optional optimization. Their ABI changed in CUDA 13, so the exact symbol
+    // compiled into this build might be unavailable in a different compatible driver environment.
+    // Keep all CUDA I/O functional through the conventional copy API in that case.
     MemcpyBatchAsync.reset();
   }
 #endif
@@ -93,7 +102,7 @@ CUresult cudaAPI::cuda_memcpy_async(CUdeviceptr dst,
                                     CUstream stream)
 {
 #if CUDA_VERSION >= 12080
-  if (cudaAPI::instance().MemcpyBatchAsync && stream != nullptr) {
+  if (supports_memcpy_batch(stream)) {
     CUmemcpyAttributes attrs{.srcAccessOrder =
                                CUmemcpySrcAccessOrder_enum::CU_MEMCPY_SRC_ACCESS_ORDER_STREAM};
     std::size_t attrs_idxs[] = {0};
@@ -115,6 +124,52 @@ CUresult cudaAPI::cuda_memcpy_async(CUdeviceptr dst,
 #else
   return cudaAPI::instance().MemcpyAsync(dst, src, size, stream);
 #endif
+}
+
+CUresult cudaAPI::cuda_memcpy_batch_async(
+  CUdeviceptr* dsts, CUdeviceptr* srcs, std::size_t* sizes, std::size_t count, CUstream stream)
+{
+  if (count == 0) { return CUDA_SUCCESS; }
+  if (dsts == nullptr || srcs == nullptr || sizes == nullptr) { return CUDA_ERROR_INVALID_VALUE; }
+
+  std::size_t non_empty_count{};
+  std::size_t non_empty_index{};
+  for (std::size_t i = 0; i < count; ++i) {
+    if (sizes[i] != 0) {
+      ++non_empty_count;
+      non_empty_index = i;
+    }
+  }
+
+  if (non_empty_count == 0) { return CUDA_SUCCESS; }
+  if (non_empty_count == 1) {
+    return cudaAPI::cuda_memcpy_async(
+      dsts[non_empty_index], srcs[non_empty_index], sizes[non_empty_index], stream);
+  }
+#if CUDA_VERSION >= 12080
+  if (non_empty_count == count && supports_memcpy_batch(stream)) {
+    CUmemcpyAttributes attrs{.srcAccessOrder =
+                               CUmemcpySrcAccessOrder_enum::CU_MEMCPY_SRC_ACCESS_ORDER_STREAM};
+    std::size_t attrs_idxs[] = {0};
+    return cudaAPI::instance().MemcpyBatchAsync(dsts,
+                                                srcs,
+                                                sizes,
+                                                count,
+                                                &attrs,
+                                                attrs_idxs,
+                                                static_cast<std::size_t>(1),
+#if CUDA_VERSION < 13000
+                                                static_cast<std::size_t*>(nullptr),
+#endif
+                                                stream);
+  }
+#endif
+  for (std::size_t i = 0; i < count; ++i) {
+    if (sizes[i] == 0) { continue; }
+    auto const result = cudaAPI::instance().MemcpyAsync(dsts[i], srcs[i], sizes[i], stream);
+    if (result != CUDA_SUCCESS) { return result; }
+  }
+  return CUDA_SUCCESS;
 }
 
 }  // namespace kvikio

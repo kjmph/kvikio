@@ -131,9 +131,9 @@ class cudaAPI {
    * @brief Asynchronous memcpy that prefers `cuMemcpyBatchAsync` when supported.
    *
    * Dispatches to `cuMemcpyBatchAsync` with `CU_MEMCPY_SRC_ACCESS_ORDER_STREAM`
-   * on CUDA >= 12.8 when `stream` is non-default; otherwise falls back to
-   * `cuMemcpyAsync`. The fallback is mandatory on the default (NULL) stream,
-   * which `cuMemcpyBatchAsync` rejects.
+   * on CUDA >= 12.8 when `stream` is not a legacy default stream; otherwise falls back to
+   * `cuMemcpyAsync`. The fallback is mandatory on the legacy default stream, which
+   * `cuMemcpyBatchAsync` rejects.
    *
    * @param dst    Destination pointer (host or device under UVA).
    * @param src    Source pointer (host or device under UVA).
@@ -145,6 +145,30 @@ class cudaAPI {
                                     CUdeviceptr src,
                                     std::size_t size,
                                     CUstream stream);
+
+  /**
+   * @brief Enqueue multiple independent copies as one CUDA batch when available.
+   *
+   * CUDA 12.8+ uses `cuMemcpyBatchAsync`; older drivers/toolkits and legacy default streams use a
+   * loop of `cuMemcpyAsync`. Zero-sized copies are ignored. Copies within a native CUDA batch have
+   * no ordering guarantees and must be independent; overlapping destinations or dependencies
+   * between copies result in undefined behavior.
+   *
+   * This function only enqueues work and never synchronizes. On success, source and destination
+   * allocations must remain alive until the stream completes. On failure, the caller must assume
+   * that any of the copies may have been enqueued and must successfully fence the stream or context
+   * before releasing or reusing any source or destination allocation. The descriptor arrays only
+   * need to remain alive until this function returns.
+   *
+   * @param dsts   Array of destination pointers. Must be non-null when `count` is nonzero.
+   * @param srcs   Array of source pointers. Must be non-null when `count` is nonzero.
+   * @param sizes  Array of copy sizes. Must be non-null when `count` is nonzero.
+   * @param count  Number of entries in `dsts`, `srcs`, and `sizes`.
+   * @param stream CUDA stream for ordering.
+   * @return `CUDA_SUCCESS`, or the error returned by the underlying CUDA operation.
+   */
+  static CUresult cuda_memcpy_batch_async(
+    CUdeviceptr* dsts, CUdeviceptr* srcs, std::size_t* sizes, std::size_t count, CUstream stream);
 };
 
 /**

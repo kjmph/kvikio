@@ -162,6 +162,8 @@ kvikio_add_test(NAME CONCURRENT_REQUEST_LIMITER_TEST SOURCES test_concurrent_req
 
 kvikio_add_test(NAME CUDA_FENCE_TEST SOURCES test_cuda_fence.cpp)
 
+kvikio_add_test(NAME CUDA_MEMCPY_BATCH_TEST SOURCES test_cuda_memcpy_batch.cpp)
+
 kvikio_add_nsys_plugin_test(
   NAME NIC_MONITOR_TEST SOURCES test_nic_monitor.cpp PLUGIN_SOURCES nic/nic_monitor.cpp
 )
