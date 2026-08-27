@@ -20,6 +20,10 @@
 #include <kvikio/error.hpp>
 #include <kvikio/shim/libcurl.hpp>
 
+#if !defined(CURL_HAS_RECV_BUFFER_CALLBACKS) || !defined(CURL_HAS_KTLS_DIRECT_RX)
+#error "KvikIO remote direct receive requires caller-owned buffers and strict RX kTLS in libcurl"
+#endif
+
 namespace kvikio {
 namespace detail {
 namespace {

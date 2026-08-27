@@ -15,11 +15,11 @@ function(find_and_configure_libcurl)
   endif()
 
   rapids_cpm_find(
-    CURL 8.13.0
+    CURL 8.22.0
     GLOBAL_TARGETS libcurl
     CPM_ARGS
-    GIT_REPOSITORY https://github.com/curl/curl
-    GIT_TAG curl-8_13_0
+    GIT_REPOSITORY https://github.com/kjmph/curl.git
+    GIT_TAG 78de15a5d2b4b8f18b358b746c00de55ed649a4f
     OPTIONS "BUILD_CURL_EXE OFF" "BUILD_SHARED_LIBS OFF" "BUILD_TESTING OFF" "CURL_USE_LIBPSL OFF"
             "CURL_DISABLE_LDAP ON" "CMAKE_POSITION_INDEPENDENT_CODE ON"
     EXCLUDE_FROM_ALL YES # Don't install libcurl.a (only needed when building libkvikio.so)
