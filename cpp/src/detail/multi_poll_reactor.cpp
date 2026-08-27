@@ -116,14 +116,17 @@ void mark_direct_receive_waiting(RemoteMultiTransfer::DirectReceiveState& state)
 {
   if (state.waiting_for_slot) { return; }
   state.waiting_for_slot = true;
-  direct_receive_waiter_count.fetch_add(1, std::memory_order_acq_rel);
+  if (state.uses_pinned_slots) {
+    direct_receive_waiter_count.fetch_add(1, std::memory_order_acq_rel);
+  }
 }
 
 void clear_direct_receive_waiting(RemoteMultiTransfer::DirectReceiveState& state) noexcept
 {
   if (!state.waiting_for_slot) { return; }
   state.waiting_for_slot = false;
-  auto current           = direct_receive_waiter_count.load(std::memory_order_acquire);
+  if (!state.uses_pinned_slots) { return; }
+  auto current = direct_receive_waiter_count.load(std::memory_order_acquire);
   while (true) {
     if (current == 0) {
       // Never wrap the global count on a defensive accounting path: that would permanently block
@@ -142,6 +145,7 @@ void clear_direct_receive_waiting(RemoteMultiTransfer::DirectReceiveState& state
 {
   return direct_receive_waiter_count.load(std::memory_order_acquire) != 0;
 }
+
 #endif
 
 }  // namespace
@@ -447,9 +451,43 @@ bool MultiPollReactor::try_install_direct_receive_slot(RemoteMultiTransfer& tran
     state.callbacks != nullptr, "direct receive has no callback state", std::logic_error);
   KVIKIO_EXPECT(
     !state.receive_slot, "direct receive already owns an installed slot", std::logic_error);
+  KVIKIO_EXPECT(!state.host_buffer_is_direct_tail && state.host_destination_offset == 0,
+                "direct receive already owns an installed host buffer",
+                std::logic_error);
   KVIKIO_EXPECT(state.callbacks->needs_buffer(),
                 "direct receive does not need a receive slot",
                 std::logic_error);
+
+  if (!transfer.is_device) {
+    auto const completed = state.callbacks->body_bytes();
+    KVIKIO_EXPECT(completed <= transfer.ctx.size,
+                  "direct-receive host body exceeds its destination",
+                  std::logic_error);
+    auto const remaining = transfer.ctx.size - completed;
+    KVIKIO_EXPECT(remaining != 0,
+                  "direct-receive host requested a buffer after completing its body",
+                  std::logic_error);
+    bool const direct_tail = state.callbacks->response_body_accepted();
+    if (direct_tail) {
+      state.callbacks->install_buffer(transfer.ctx.buf + completed, remaining, false);
+    } else {
+      if (state.host_framing_buffer.empty()) {
+        state.host_framing_buffer.resize(DirectReceiveSlotPool::minimum_slot_size());
+      }
+      state.callbacks->install_buffer(state.host_framing_buffer.data(),
+                                      state.host_framing_buffer.size());
+    }
+    state.host_buffer_is_direct_tail = direct_tail;
+    state.host_destination_offset    = completed;
+    if (resume_transfer) {
+      auto const result = curl_easy_pause(transfer.curl->handle(), CURLPAUSE_CONT);
+      KVIKIO_EXPECT(result == CURLE_OK,
+                    std::string{"curl_easy_pause(CURLPAUSE_CONT): "} + curl_easy_strerror(result),
+                    std::runtime_error);
+      clear_direct_receive_waiting(state);
+    }
+    return true;
+  }
 
   std::optional<DirectReceiveSlotPool::Slot> slot;
   {
@@ -514,8 +552,49 @@ void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer
 {
   auto& state = *transfer.direct_receive;
   if (!state.callbacks->slot_ready()) { return; }
+
+  if (!transfer.is_device) {
+    KVIKIO_EXPECT(!state.receive_slot,
+                  "direct-receive host path unexpectedly owns a pinned slot",
+                  std::logic_error);
+    bool const direct_tail = state.host_buffer_is_direct_tail;
+    KVIKIO_EXPECT(state.host_destination_offset <= transfer.ctx.size,
+                  "direct-receive host buffer begins outside its destination",
+                  std::logic_error);
+
+    auto const released = state.callbacks->take_released_slot();
+    auto const body_end = state.callbacks->body_bytes();
+    KVIKIO_EXPECT(released.body_bytes <= body_end,
+                  "direct-receive host body accounting underflow",
+                  std::logic_error);
+    auto const body_begin = body_end - released.body_bytes;
+    auto const source =
+      direct_tail ? static_cast<void const*>(transfer.ctx.buf + state.host_destination_offset)
+                  : static_cast<void const*>(state.host_framing_buffer.data());
+    auto const source_capacity = direct_tail ? transfer.ctx.size - state.host_destination_offset
+                                             : state.host_framing_buffer.size();
+    auto const placement       = place_direct_receive_on_host(source,
+                                                        source_capacity,
+                                                        released,
+                                                        transfer.ctx.buf,
+                                                        transfer.ctx.size,
+                                                        body_begin,
+                                                        direct_tail);
+    state.host_direct_bytes += placement.direct_bytes;
+    state.host_staged_bytes += placement.staged_bytes;
+    state.host_buffer_is_direct_tail = false;
+    state.host_destination_offset    = 0;
+
+    if (state.callbacks->body_complete()) {
+      clear_direct_receive_waiting(state);
+    } else {
+      mark_direct_receive_waiting(state);
+    }
+    return;
+  }
+
   KVIKIO_EXPECT(state.receive_slot,
-                "direct receive published a slot without reactor ownership",
+                "direct receive published a GPU slot without reactor ownership",
                 std::logic_error);
 
   auto released = state.callbacks->take_released_slot();
@@ -565,7 +644,7 @@ void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer
     // immediately so CURLMSG_DONE cannot race a still-collecting final batch.
     work->owners[owner_index] = &transfer;
     ++work->owner_count;
-    ++state.cuda_slots_outstanding;
+    ++state.consumer_slots_outstanding;
     if (state.callbacks->body_complete()) {
       clear_direct_receive_waiting(state);
     } else {
@@ -590,32 +669,36 @@ void MultiPollReactor::resume_waiting_direct_receive_transfers()
   // Waiting transfers get first chance at every slot recycled since the preceding loop. This walk
   // deliberately precedes pending admission below. The process-wide waiter count extends that
   // priority across reactors without blocking an I/O thread on a condition variable.
+  bool pinned_slots_exhausted{};
   for (auto& [_, transfer] : _in_flight) {
     if (transfer->direct_receive == nullptr || transfer->direct_receive->network_done ||
         !transfer->direct_receive->waiting_for_slot) {
       continue;
     }
+    if (transfer->direct_receive->uses_pinned_slots && pinned_slots_exhausted) { continue; }
     if (!try_install_direct_receive_slot(*transfer, true)) {
       if (direct_receive_pool_is_permanently_exhausted()) {
-        fail_direct_receive_after_cuda(
+        fail_direct_receive_after_consumer(
           *transfer,
           std::make_exception_ptr(std::runtime_error(
             "direct-receive pinned-slot pool is permanently exhausted by quarantined "
             "allocations")));
         continue;
       }
-      // No slot is available process-wide. Later waiters cannot succeed in this loop either.
-      break;
+      // A later GPU waiter cannot acquire the same exhausted process-wide pool in this pass, but a
+      // host waiter owns its receive loan and can still resume. Avoid head-of-line blocking it.
+      pinned_slots_exhausted = true;
+      continue;
     }
     collect_direct_receive_slot(*transfer);
   }
 }
 
-void MultiPollReactor::fail_direct_receive_after_cuda(RemoteMultiTransfer& transfer,
-                                                      std::exception_ptr failure) noexcept
+void MultiPollReactor::fail_direct_receive_after_consumer(RemoteMultiTransfer& transfer,
+                                                          std::exception_ptr failure) noexcept
 {
   auto& state = *transfer.direct_receive;
-  if (state.cuda_failure == nullptr) { state.cuda_failure = std::move(failure); }
+  if (state.consumer_failure == nullptr) { state.consumer_failure = std::move(failure); }
   if (state.network_done) { return; }
 
   // We are on the reactor thread and outside curl_multi_perform(), so detaching cancels further
@@ -662,11 +745,11 @@ bool MultiPollReactor::reap_direct_receive_batches()
                     std::logic_error);
       auto& transfer = *it->owners[cookie];
       auto& state    = *transfer.direct_receive;
-      KVIKIO_EXPECT(state.cuda_slots_outstanding != 0,
+      KVIKIO_EXPECT(state.consumer_slots_outstanding != 0,
                     "direct-receive CUDA completion underflow",
                     std::logic_error);
-      --state.cuda_slots_outstanding;
-      if (batch_failure != nullptr) { fail_direct_receive_after_cuda(transfer, batch_failure); }
+      --state.consumer_slots_outstanding;
+      if (batch_failure != nullptr) { fail_direct_receive_after_consumer(transfer, batch_failure); }
     };
     if (failed_before_submission) {
       for (std::size_t cookie = 0; cookie < it->owner_count; ++cookie) {
@@ -711,6 +794,7 @@ void MultiPollReactor::requeue_direct_receive(
     auto const file_offset                = transfer->direct_receive->file_offset;
     auto const fallback_allowed           = transfer->direct_receive->fallback_allowed;
     auto const strict_activation_recorded = transfer->direct_receive->strict_activation_recorded;
+    auto const uses_pinned_slots          = transfer->direct_receive->uses_pinned_slots;
     transfer->direct_receive->receive_slot.reset();
 
     // A CURLMSG_DONE handle has no attached connection, so curl_easy_pause() is invalid here.
@@ -726,6 +810,7 @@ void MultiPollReactor::requeue_direct_receive(
     next->fallback_allowed           = fallback_allowed;
     next->strict_attempt             = strict_attempt;
     next->strict_activation_recorded = strict_activation_recorded;
+    next->uses_pinned_slots          = uses_pinned_slots;
     next->callbacks = std::make_unique<CurlDirectReceiveState>(file_offset, transfer->ctx.size);
     next->callbacks->configure(*transfer->curl, strict_attempt);
     transfer->direct_receive = std::move(next);
@@ -746,7 +831,7 @@ void MultiPollReactor::finish_direct_receive_transfers(
   for (auto it = _in_flight.begin(); it != _in_flight.end();) {
     auto* transfer_ptr = it->second.get();
     if (transfer_ptr->direct_receive == nullptr || !transfer_ptr->direct_receive->network_done ||
-        transfer_ptr->direct_receive->cuda_slots_outstanding != 0) {
+        transfer_ptr->direct_receive->consumer_slots_outstanding != 0) {
       ++it;
       continue;
     }
@@ -763,9 +848,9 @@ void MultiPollReactor::finish_direct_receive_transfers(
         direct_receive_record_strict_activated();
       }
 
-      if (state.cuda_failure != nullptr) {
+      if (state.consumer_failure != nullptr) {
         record_direct_receive_failure(*transfer, false);
-        fail_aggregate_transfer(*transfer, state.cuda_failure);
+        fail_aggregate_transfer(*transfer, state.consumer_failure);
         continue;
       }
 
@@ -798,9 +883,17 @@ void MultiPollReactor::finish_direct_receive_transfers(
         if (state.strict_attempt) {
           direct_receive_record_strict_completion(state.callbacks->raw_bytes(),
                                                   state.callbacks->body_bytes());
+          if (!transfer->is_device) {
+            direct_receive_record_strict_host_completion(state.host_direct_bytes,
+                                                         state.host_staged_bytes);
+          }
         } else {
           direct_receive_record_copied_completion(state.callbacks->raw_bytes(),
                                                   state.callbacks->body_bytes());
+          if (!transfer->is_device) {
+            direct_receive_record_copied_host_completion(state.host_direct_bytes,
+                                                         state.host_staged_bytes);
+          }
         }
         transfer->aggregate_terminal_reported = true;
         transfer->aggregate->on_subrange_complete(transfer->ctx.size);
@@ -872,6 +965,7 @@ void MultiPollReactor::io_thread_main()
       // requeue work before the pending walk, so this spans the complete loop iteration.
       std::optional<std::chrono::steady_clock::time_point> earliest_ready_at;
 #if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+      bool direct_receive_host_progress{};
       _cuda_completion_hint.store(false, std::memory_order_release);
       if (_cuda_wakeup_failed.exchange(false, std::memory_order_acq_rel)) {
         _cuda_host_wakeup_enabled = false;
@@ -888,7 +982,8 @@ void MultiPollReactor::io_thread_main()
       direct_cuda_completed = reap_direct_receive_batches() || direct_cuda_completed;
       finish_direct_receive_transfers(earliest_ready_at);
 #else
-      bool constexpr direct_cuda_completed = false;
+      bool constexpr direct_cuda_completed        = false;
+      bool constexpr direct_receive_host_progress = false;
 #endif
 
       // Stage (1): Splice newly submitted transfers out of the inbox (shared by the reactor thread
@@ -967,47 +1062,45 @@ void MultiPollReactor::io_thread_main()
             break;
           }
 
-          if (transfer->is_device) {
 #if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
-            if (transfer->direct_receive != nullptr) {
-              if (direct_receive_has_waiters()) {
-                deferred_for_resource = true;
-                deferred_transfers.push_back(std::move(transfer));
-                continue;
-              }
-              if (!try_install_direct_receive_slot(*transfer, false)) {
-                if (direct_receive_pool_is_permanently_exhausted()) {
-                  auto const failure = std::make_exception_ptr(std::runtime_error(
-                    "direct-receive pinned-slot pool is permanently exhausted by quarantined "
-                    "allocations"));
-                  record_direct_receive_failure(*transfer, false);
-                  fail_aggregate_transfer(*transfer, failure);
-                } else {
-                  deferred_for_resource = true;
-                  deferred_transfers.push_back(std::move(transfer));
-                }
-                continue;
-              }
-            } else
-#endif
-            {
-              // Gate 2 caps bounce-buffer use per (reactor thread, CUDA context) across all
-              // pipeline phases. A limiter slot freed at libcurl completion does not free the
-              // buffer, which stays in-flight until the H2D drains and the recycle callback fires.
-              std::optional<CudaPinnedBounceBufferPool::Buffer> bounce_buffer;
-              {
-                PushAndPopContext c(transfer->device_ctx);
-                bounce_buffer = BounceBufferCache::instance().try_get(transfer->device_ctx);
-              }
-              if (!bounce_buffer.has_value()) {
-                deferred_for_resource = true;
-                exhausted_ctxs.push_back(transfer->device_ctx);
-                deferred_transfers.push_back(std::move(transfer));
-                continue;
-              }
-              transfer->buffer            = std::move(bounce_buffer.value());
-              transfer->ctx.pinned_buffer = transfer->buffer.get();
+          if (transfer->direct_receive != nullptr) {
+            if (transfer->direct_receive->uses_pinned_slots && direct_receive_has_waiters()) {
+              deferred_for_resource = true;
+              deferred_transfers.push_back(std::move(transfer));
+              continue;
             }
+            if (!try_install_direct_receive_slot(*transfer, false)) {
+              if (direct_receive_pool_is_permanently_exhausted()) {
+                auto const failure = std::make_exception_ptr(std::runtime_error(
+                  "direct-receive pinned-slot pool is permanently exhausted by quarantined "
+                  "allocations"));
+                record_direct_receive_failure(*transfer, false);
+                fail_aggregate_transfer(*transfer, failure);
+              } else {
+                deferred_for_resource = true;
+                deferred_transfers.push_back(std::move(transfer));
+              }
+              continue;
+            }
+          } else
+#endif
+            if (transfer->is_device) {
+            // Gate 2 caps bounce-buffer use per (reactor thread, CUDA context) across all pipeline
+            // phases. A limiter slot freed at libcurl completion does not free the buffer, which
+            // stays in-flight until the H2D drains and the recycle callback fires.
+            std::optional<CudaPinnedBounceBufferPool::Buffer> bounce_buffer;
+            {
+              PushAndPopContext c(transfer->device_ctx);
+              bounce_buffer = BounceBufferCache::instance().try_get(transfer->device_ctx);
+            }
+            if (!bounce_buffer.has_value()) {
+              deferred_for_resource = true;
+              exhausted_ctxs.push_back(transfer->device_ctx);
+              deferred_transfers.push_back(std::move(transfer));
+              continue;
+            }
+            transfer->buffer            = std::move(bounce_buffer.value());
+            transfer->ctx.pinned_buffer = transfer->buffer.get();
           }
 
           CURL* easy = transfer->curl->handle();
@@ -1078,6 +1171,16 @@ void MultiPollReactor::io_thread_main()
       // DONE messages; the final short slot is finalized in the DONE branch below.
       for (auto& [_, transfer] : _in_flight) {
         if (transfer->direct_receive != nullptr && !transfer->direct_receive->network_done) {
+          auto& state = *transfer->direct_receive;
+          // The first host buffer protects the destination from HTTP headers. Once the final 206
+          // header block is accepted, rotate that bounded staging buffer immediately instead of
+          // filling it with payload. The next buffer can be the remaining final destination.
+          if (!transfer->is_device && !state.host_buffer_is_direct_tail &&
+              !state.callbacks->slot_ready() && state.callbacks->response_body_accepted()) {
+            state.callbacks->finalize_current_slot();
+          }
+          direct_receive_host_progress =
+            direct_receive_host_progress || (!transfer->is_device && state.callbacks->slot_ready());
           collect_direct_receive_slot(*transfer);
         }
       }
@@ -1107,6 +1210,8 @@ void MultiPollReactor::io_thread_main()
           transfer.attachment.reset();
           transfer.slot.reset();
           state.callbacks->finalize_current_slot();
+          direct_receive_host_progress =
+            direct_receive_host_progress || (!transfer.is_device && state.callbacks->slot_ready());
           collect_direct_receive_slot(transfer);
           clear_direct_receive_waiting(state);
           state.network_result = res;
@@ -1213,7 +1318,11 @@ void MultiPollReactor::io_thread_main()
       constexpr int idle_timeout_ms = 1000;
       constexpr int busy_timeout_ms = 10;
       int poll_timeout_ms{};
-      if (_pending.empty()) {
+      if (direct_receive_host_progress) {
+        // A host staging slot was copied or a destination-backed loan completed. Loop immediately
+        // so a paused transfer can install its next buffer before sleeping in curl_multi_poll().
+        poll_timeout_ms = 0;
+      } else if (_pending.empty()) {
         // Nothing queued
         poll_timeout_ms = idle_timeout_ms;
       } else if (!deferred_for_resource && earliest_ready_at.has_value()) {

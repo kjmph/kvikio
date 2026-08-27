@@ -199,11 +199,12 @@ struct RemoteMultiTransfer {
 
 #if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
   /**
-   * @brief Reactor-owned state for one caller-owned GPU receive transfer.
+   * @brief Reactor-owned state for one caller-owned receive transfer.
    *
-   * Network completion and CUDA completion are deliberately separate. `network_done` releases the
-   * easy-handle attachment and request-limiter slot, while `cuda_slots_outstanding` keeps this
-   * transfer alive until every source slot has reached a terminal CUDA batch.
+   * Network completion and destination completion are deliberately separate. `network_done`
+   * releases the easy-handle attachment and request-limiter slot. GPU reads remain alive until
+   * every pinned source slot has reached a terminal CUDA batch; host reads finish their synchronous
+   * placement before returning from the reactor iteration.
    */
   struct DirectReceiveState {
     ~DirectReceiveState();
@@ -212,12 +213,20 @@ struct RemoteMultiTransfer {
     bool fallback_allowed{};
     bool strict_attempt{true};
     bool strict_activation_recorded{};
+    bool uses_pinned_slots{};
     bool waiting_for_slot{};
     bool network_done{};
     bool failure_recorded{};
+    bool host_buffer_is_direct_tail{};
     CURLcode network_result{CURLE_OK};
-    std::size_t cuda_slots_outstanding{};
-    std::exception_ptr cuda_failure;
+    std::size_t host_destination_offset{};
+    std::size_t host_direct_bytes{};
+    std::size_t host_staged_bytes{};
+    std::size_t consumer_slots_outstanding{};
+    std::exception_ptr consumer_failure;
+    // Lazily allocated only after network admission and not retained across retry backoff, keeping
+    // ordinary host scratch bounded by active request concurrency.
+    std::vector<std::byte> host_framing_buffer;
     std::unique_ptr<CurlDirectReceiveState> callbacks;
     DirectReceiveSlotPool::Slot receive_slot;
   };
@@ -392,8 +401,8 @@ class MultiPollReactor {
   void submit_direct_receive_batch(DirectReceiveCudaWork& work);
   void submit_collecting_direct_receive_batches();
   [[nodiscard]] bool reap_direct_receive_batches();
-  void fail_direct_receive_after_cuda(RemoteMultiTransfer& transfer,
-                                      std::exception_ptr failure) noexcept;
+  void fail_direct_receive_after_consumer(RemoteMultiTransfer& transfer,
+                                          std::exception_ptr failure) noexcept;
   void finish_direct_receive_transfers(
     std::optional<std::chrono::steady_clock::time_point>& earliest_ready_at);
   void requeue_direct_receive(std::unique_ptr<RemoteMultiTransfer> transfer,

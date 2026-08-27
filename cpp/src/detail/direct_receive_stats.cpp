@@ -36,9 +36,22 @@ struct AtomicDirectReceiveStats {
   std::atomic<std::uint64_t> fallback_ineligible_request{};
 };
 
+struct AtomicDirectReceiveHostStats {
+  std::atomic<std::uint64_t> strict_rx_direct_placement_bytes{};
+  std::atomic<std::uint64_t> strict_rx_framing_compaction_bytes{};
+  std::atomic<std::uint64_t> copied_stream_direct_placement_bytes{};
+  std::atomic<std::uint64_t> copied_stream_framing_compaction_bytes{};
+};
+
 AtomicDirectReceiveStats& atomic_stats() noexcept
 {
   static AtomicDirectReceiveStats stats;
+  return stats;
+}
+
+AtomicDirectReceiveHostStats& atomic_host_stats() noexcept
+{
+  static AtomicDirectReceiveHostStats stats;
   return stats;
 }
 
@@ -85,6 +98,15 @@ RemoteDirectReceiveStats remote_direct_receive_stats() noexcept
           .fallback_ineligible_request       = load(s.fallback_ineligible_request)};
 }
 
+RemoteDirectReceiveHostStats remote_direct_receive_host_stats() noexcept
+{
+  auto const& s = atomic_host_stats();
+  return {.strict_rx_direct_placement_bytes       = load(s.strict_rx_direct_placement_bytes),
+          .strict_rx_framing_compaction_bytes     = load(s.strict_rx_framing_compaction_bytes),
+          .copied_stream_direct_placement_bytes   = load(s.copied_stream_direct_placement_bytes),
+          .copied_stream_framing_compaction_bytes = load(s.copied_stream_framing_compaction_bytes)};
+}
+
 void reset_remote_direct_receive_stats() noexcept
 {
   auto& s = atomic_stats();
@@ -109,6 +131,11 @@ void reset_remote_direct_receive_stats() noexcept
   clear(s.protocol_validation_failures);
   clear(s.fallback_capability_unavailable);
   clear(s.fallback_ineligible_request);
+  auto& host = atomic_host_stats();
+  clear(host.strict_rx_direct_placement_bytes);
+  clear(host.strict_rx_framing_compaction_bytes);
+  clear(host.copied_stream_direct_placement_bytes);
+  clear(host.copied_stream_framing_compaction_bytes);
 }
 
 namespace detail {
@@ -143,6 +170,20 @@ void direct_receive_record_copied_h2d_submission(std::size_t bytes, std::size_t 
   auto& s = atomic_stats();
   increment(s.copied_stream_h2d_bytes, bytes);
   increment(s.copied_stream_h2d_batches, batches);
+}
+void direct_receive_record_strict_host_completion(std::size_t direct_bytes,
+                                                  std::size_t framing_compaction_bytes) noexcept
+{
+  auto& s = atomic_host_stats();
+  increment(s.strict_rx_direct_placement_bytes, direct_bytes);
+  increment(s.strict_rx_framing_compaction_bytes, framing_compaction_bytes);
+}
+void direct_receive_record_copied_host_completion(std::size_t direct_bytes,
+                                                  std::size_t framing_compaction_bytes) noexcept
+{
+  auto& s = atomic_host_stats();
+  increment(s.copied_stream_direct_placement_bytes, direct_bytes);
+  increment(s.copied_stream_framing_compaction_bytes, framing_compaction_bytes);
 }
 void direct_receive_record_fallback(DirectReceiveFallbackReason reason) noexcept
 {

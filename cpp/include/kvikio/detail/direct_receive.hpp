@@ -46,7 +46,7 @@ struct DirectReceiveSpan {
 inline constexpr std::size_t direct_receive_max_spans_per_slot = 256;
 
 /**
- * @brief Fixed-capacity description of one released receive slot ready for H2D submission.
+ * @brief Fixed-capacity description of one released receive slot ready for destination placement.
  *
  * The descriptor is fixed-size so taking a slot from the curl callback state cannot allocate. Its
  * destination offsets are relative to the complete requested range, not merely this slot.
@@ -57,6 +57,28 @@ struct DirectReceiveReleasedSlot {
   std::size_t raw_bytes{};
   std::size_t body_bytes{};
 };
+
+struct DirectReceiveHostPlacement {
+  std::size_t direct_bytes{};
+  std::size_t staged_bytes{};
+};
+
+/**
+ * @brief Validate and publish one released receive buffer into a host destination.
+ *
+ * A framing buffer is copied only after its complete fixed-capacity scatter description validates.
+ * A destination-backed buffer needs no copy, but it must contain only a contiguous body prefix at
+ * the exact final offset assigned by the response tracker. Framing validation completes before
+ * this helper modifies the destination; direct-tail validation performs no additional writes.
+ */
+[[nodiscard]] DirectReceiveHostPlacement place_direct_receive_on_host(
+  void const* source,
+  std::size_t source_capacity,
+  DirectReceiveReleasedSlot const& released,
+  void* destination,
+  std::size_t destination_extent,
+  std::size_t expected_destination_offset,
+  bool direct_destination_buffer);
 
 /**
  * @brief Tracks body spans that libcurl exposes from a caller-owned raw receive buffer.
@@ -133,12 +155,15 @@ class DirectReceiveResponse {
 #if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
 
 /**
- * @brief One-transfer bridge between patched libcurl and KvikIO's pinned buffer.
+ * @brief One-transfer bridge between patched libcurl and a reactor-managed receive buffer.
  *
- * A transfer loans consecutive unused regions of one bounded pinned allocation. A release advances
- * the allocation cursor by the raw bytes consumed, so later receive cycles cannot overwrite spans
- * retained for the eventual H2D batch. The accelerated path admits only ranges with enough spare
- * capacity for bounded HTTP headers and never allocates or copies in a callback.
+ * A transfer loans consecutive unused regions of one receive buffer. A release advances the
+ * allocation cursor by the raw bytes consumed, so later receive cycles cannot overwrite spans
+ * retained by the consumer. GPU reads install bounded pinned slots for eventual H2D batches. Once
+ * a host read has validated the final response headers, it may instead install the unfilled portion
+ * of the caller's final destination and receive the remaining body there directly. Framing uses a
+ * separate bounded host window, so even a one-byte payload never forces byte-at-a-time network
+ * progress. The callback path itself never allocates or copies.
  */
 class CurlDirectReceiveState {
  public:
@@ -157,10 +182,12 @@ class CurlDirectReceiveState {
    * latter is the explicit copied fallback for `PREFER`; it never masquerades as direct RX.
    */
   void configure(CurlHandle& curl, bool require_ktls);
-  void install_buffer(void* pinned_buffer, std::size_t capacity);
+  void install_buffer(void* receive_buffer, std::size_t capacity);
+  void install_buffer(void* receive_buffer, std::size_t capacity, bool rotate_before_short_loan);
   [[nodiscard]] bool slot_ready() const noexcept;
   [[nodiscard]] bool needs_buffer() const noexcept;
   [[nodiscard]] bool body_complete() const noexcept;
+  [[nodiscard]] bool response_body_accepted() const noexcept;
   void finalize_current_slot() noexcept;
   [[nodiscard]] DirectReceiveReleasedSlot take_released_slot();
   [[nodiscard]] std::optional<std::string> validate(CurlHandle& curl) const;
@@ -215,7 +242,7 @@ class CurlDirectReceiveState {
   void fail_callback(CallbackError error) noexcept;
   [[nodiscard]] static std::string_view callback_error_message(CallbackError error) noexcept;
 
-  void* _pinned_buffer{};
+  void* _receive_buffer{};
   std::size_t _capacity{};
   std::size_t _requested_offset;
   std::size_t _requested_size;
@@ -225,6 +252,7 @@ class CurlDirectReceiveState {
   DirectReceiveResponse _response;
   bool _loan_outstanding{};
   bool _loan_ever_released{};
+  bool _rotate_before_short_loan{true};
   void* _loan_buffer{};
   std::size_t _loan_capacity{};
   std::size_t _loan_body_high_water{};

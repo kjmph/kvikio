@@ -30,6 +30,10 @@ void direct_receive_record_copied_completion(std::size_t raw_bytes,
                                              std::size_t body_bytes) noexcept;
 void direct_receive_record_copied_h2d_submission(std::size_t bytes,
                                                  std::size_t batches = 1) noexcept;
+void direct_receive_record_strict_host_completion(std::size_t direct_bytes,
+                                                  std::size_t framing_compaction_bytes) noexcept;
+void direct_receive_record_copied_host_completion(std::size_t direct_bytes,
+                                                  std::size_t framing_compaction_bytes) noexcept;
 void direct_receive_record_fallback(DirectReceiveFallbackReason reason) noexcept;
 void direct_receive_record_failed(DirectReceiveFailureReason reason) noexcept;
 void direct_receive_record_retry() noexcept;

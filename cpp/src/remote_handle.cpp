@@ -973,7 +973,7 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
   bool record_ineligible_direct_receive_fallback{};
   bool direct_receive_strict_attempt{};
   if (direct_receive_mode != RemoteDirectReceiveMode::OFF) {
-    bool const eligible_backend  = io_backend == RemoteIOBackend::MULTI_POLL && !is_host_mem;
+    bool const eligible_backend  = io_backend == RemoteIOBackend::MULTI_POLL;
     bool const eligible_endpoint = _endpoint->supports_exact_http_range();
 #if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
     bool constexpr eligible_build = true;
@@ -982,7 +982,7 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
 #endif
     if (direct_receive_mode == RemoteDirectReceiveMode::REQUIRE) {
       KVIKIO_EXPECT(eligible_backend,
-                    "remote direct receive REQUIRE needs the MULTI_POLL device path",
+                    "remote direct receive REQUIRE needs the MULTI_POLL backend",
                     std::runtime_error);
       KVIKIO_EXPECT(eligible_build,
                     "remote direct receive REQUIRE needs a direct-receive-enabled libcurl build",
@@ -1107,33 +1107,34 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
     transfer->ctx.size     = subrange_size;
     transfer->aggregate    = aggregate;
     transfer->retry_policy = retry_policy;
-    if (is_host_mem) {
-      transfer->ctx.buf = cur_buf;
-      transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_host_memory);
-    } else {
+    if (!is_host_mem) {
       transfer->is_device  = true;
       transfer->device_ctx = io_event_barrier->cuda_context();
       transfer->device_dst = cur_buf;
-#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
-      if (use_direct_receive) {
-        transfer->direct_receive =
-          std::make_unique<detail::RemoteMultiTransfer::DirectReceiveState>();
-        transfer->direct_receive->file_offset = cur_off;
-        transfer->direct_receive->fallback_allowed =
-          direct_receive_mode == RemoteDirectReceiveMode::PREFER;
-        transfer->direct_receive->strict_attempt = direct_receive_strict_attempt;
-        transfer->direct_receive->callbacks =
-          std::make_unique<detail::CurlDirectReceiveState>(cur_off, subrange_size);
-        transfer->direct_receive->callbacks->configure(*transfer->curl,
-                                                       direct_receive_strict_attempt);
-      } else
-#endif
-      {
-        transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_pinned_buffer);
-        transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
-      }
+    } else {
+      transfer->ctx.buf = cur_buf;
     }
-    if (is_host_mem) {
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+    if (use_direct_receive) {
+      transfer->direct_receive =
+        std::make_unique<detail::RemoteMultiTransfer::DirectReceiveState>();
+      transfer->direct_receive->file_offset = cur_off;
+      transfer->direct_receive->fallback_allowed =
+        direct_receive_mode == RemoteDirectReceiveMode::PREFER;
+      transfer->direct_receive->strict_attempt    = direct_receive_strict_attempt;
+      transfer->direct_receive->uses_pinned_slots = !is_host_mem;
+      transfer->direct_receive->callbacks =
+        std::make_unique<detail::CurlDirectReceiveState>(cur_off, subrange_size);
+      transfer->direct_receive->callbacks->configure(*transfer->curl,
+                                                     direct_receive_strict_attempt);
+    } else
+#endif
+    {
+      if (is_host_mem) {
+        transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_host_memory);
+      } else {
+        transfer->curl->setopt(CURLOPT_WRITEFUNCTION, &detail::callback_pinned_buffer);
+      }
       transfer->curl->setopt(CURLOPT_WRITEDATA, static_cast<void*>(&transfer->ctx));
     }
     transfers.push_back(std::move(transfer));

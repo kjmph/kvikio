@@ -9,6 +9,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -21,6 +22,85 @@
 #include <kvikio/detail/direct_receive.hpp>
 #include <kvikio/detail/direct_receive_slot_pool.hpp>
 #include <kvikio/shim/libcurl.hpp>
+
+TEST(DirectReceiveHostPlacement, copies_validated_framing_spans_after_full_validation)
+{
+  std::array<std::byte, 16> source{};
+  source[2]  = std::byte{0xa1};
+  source[3]  = std::byte{0xa2};
+  source[4]  = std::byte{0xa3};
+  source[9]  = std::byte{0xb1};
+  source[10] = std::byte{0xb2};
+  std::array<std::byte, 14> destination{};
+  destination.fill(std::byte{0x6d});
+
+  kvikio::detail::DirectReceiveReleasedSlot released;
+  released.spans[0]   = {.source_offset = 2, .destination_offset = 3, .size = 3};
+  released.spans[1]   = {.source_offset = 9, .destination_offset = 6, .size = 2};
+  released.span_count = 2;
+  released.raw_bytes  = 11;
+  released.body_bytes = 5;
+
+  auto const placement = kvikio::detail::place_direct_receive_on_host(
+    source.data(), source.size(), released, destination.data(), destination.size(), 3, false);
+  EXPECT_EQ(placement.direct_bytes, 0);
+  EXPECT_EQ(placement.staged_bytes, 5);
+  EXPECT_EQ(destination[2], std::byte{0x6d});
+  EXPECT_EQ(destination[3], std::byte{0xa1});
+  EXPECT_EQ(destination[4], std::byte{0xa2});
+  EXPECT_EQ(destination[5], std::byte{0xa3});
+  EXPECT_EQ(destination[6], std::byte{0xb1});
+  EXPECT_EQ(destination[7], std::byte{0xb2});
+  EXPECT_EQ(destination[8], std::byte{0x6d});
+}
+
+TEST(DirectReceiveHostPlacement, validates_every_framing_span_before_mutating_destination)
+{
+  std::array<std::byte, 16> source{};
+  source.fill(std::byte{0xa5});
+  std::array<std::byte, 12> destination{};
+  destination.fill(std::byte{0x3c});
+  auto const before = destination;
+
+  kvikio::detail::DirectReceiveReleasedSlot released;
+  released.spans[0]   = {.source_offset = 2, .destination_offset = 3, .size = 3};
+  released.spans[1]   = {.source_offset = 15, .destination_offset = 6, .size = 2};
+  released.span_count = 2;
+  released.raw_bytes  = source.size();
+  released.body_bytes = 5;
+
+  EXPECT_THROW(
+    static_cast<void>(kvikio::detail::place_direct_receive_on_host(
+      source.data(), source.size(), released, destination.data(), destination.size(), 3, false)),
+    std::logic_error);
+  EXPECT_EQ(destination, before);
+}
+
+TEST(DirectReceiveHostPlacement, requires_direct_tail_to_cover_only_contiguous_body_bytes)
+{
+  std::array<std::byte, 12> destination{};
+  destination.fill(std::byte{0x4e});
+  auto const before = destination;
+
+  kvikio::detail::DirectReceiveReleasedSlot released;
+  released.spans[0]   = {.source_offset = 0, .destination_offset = 4, .size = 4};
+  released.span_count = 1;
+  released.raw_bytes  = 5;
+  released.body_bytes = 4;
+
+  EXPECT_THROW(
+    static_cast<void>(kvikio::detail::place_direct_receive_on_host(
+      destination.data() + 4, 5, released, destination.data(), destination.size(), 4, true)),
+    std::logic_error);
+  EXPECT_EQ(destination, before);
+
+  released.raw_bytes   = 4;
+  auto const placement = kvikio::detail::place_direct_receive_on_host(
+    destination.data() + 4, 4, released, destination.data(), destination.size(), 4, true);
+  EXPECT_EQ(placement.direct_bytes, 4);
+  EXPECT_EQ(placement.staged_bytes, 0);
+  EXPECT_EQ(destination, before);
+}
 
 TEST(DirectReceiveSpanTracker, records_body_after_headers_without_copy)
 {
@@ -595,12 +675,33 @@ TEST(CurlDirectReceiveState, exact_full_final_slot_does_not_wait_for_another_buf
   EXPECT_FALSE(state.needs_buffer());
 }
 
-TEST(CurlDirectReceiveState, streaming_slots_must_hold_one_tls_record)
+TEST(CurlDirectReceiveState, short_direct_loans_reuse_zero_byte_releases)
 {
-  std::vector<std::byte> too_small(kvikio::detail::DirectReceiveSlotPool::minimum_slot_size() - 1);
+  std::array<std::byte, 1> storage{};
   kvikio::detail::CurlDirectReceiveState state{0, 1};
-  EXPECT_THROW(state.install_buffer(too_small.data(), too_small.size()), std::logic_error);
-  EXPECT_TRUE(state.needs_buffer());
+  EXPECT_THROW(state.install_buffer(storage.data(), 0), std::logic_error);
+
+  // GPU pool configuration retains its TLS-record floor, while a validated host tail may be
+  // smaller than one record. A socket EAGAIN can release that loan without progress; retain and
+  // reacquire the same byte instead of rotating the reactor through an empty ready slot.
+  EXPECT_THROW(state.install_buffer(storage.data(), storage.size()), std::logic_error);
+  state.install_buffer(storage.data(), storage.size(), false);
+  curl_recv_buffer loan{};
+  EXPECT_EQ(state.acquire_buffer(storage.size(), &loan), CURL_RECV_BUFFER_OK);
+  EXPECT_EQ(loan.buffer, storage.data());
+  EXPECT_EQ(loan.length, storage.size());
+  accept_range(state, 0, 1);
+  state.release_buffer(&loan, 0);
+  EXPECT_FALSE(state.slot_ready());
+  EXPECT_FALSE(state.needs_buffer());
+
+  curl_recv_buffer retry_loan{};
+  EXPECT_EQ(state.acquire_buffer(storage.size(), &retry_loan), CURL_RECV_BUFFER_OK);
+  EXPECT_EQ(retry_loan.buffer, storage.data());
+  EXPECT_EQ(retry_loan.length, storage.size());
+  EXPECT_EQ(state.consume_body(static_cast<char*>(retry_loan.buffer), 1, 1), 1);
+  state.release_buffer(&retry_loan, 1);
+  EXPECT_TRUE(state.slot_ready());
 }
 
 TEST(CurlDirectReceiveState, release_cannot_exclude_a_retained_body_span)

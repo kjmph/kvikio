@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -16,6 +17,7 @@
 
 #include <kvikio/detail/direct_receive.hpp>
 #include <kvikio/detail/direct_receive_slot_pool.hpp>
+#include <kvikio/error.hpp>
 #include <kvikio/shim/libcurl.hpp>
 
 namespace kvikio {
@@ -88,6 +90,92 @@ std::optional<std::size_t> parse_size(std::string_view value) noexcept
 }
 
 }  // namespace
+
+DirectReceiveHostPlacement place_direct_receive_on_host(void const* source,
+                                                        std::size_t source_capacity,
+                                                        DirectReceiveReleasedSlot const& released,
+                                                        void* destination,
+                                                        std::size_t destination_extent,
+                                                        std::size_t expected_destination_offset,
+                                                        bool direct_destination_buffer)
+{
+  KVIKIO_EXPECT(source != nullptr, "direct-receive host source is null", std::logic_error);
+  KVIKIO_EXPECT(
+    destination != nullptr, "direct-receive host destination is null", std::logic_error);
+  KVIKIO_EXPECT(released.span_count <= released.spans.size(),
+                "direct-receive host span count exceeds its descriptor capacity",
+                std::logic_error);
+  KVIKIO_EXPECT(released.raw_bytes <= source_capacity,
+                "direct-receive host source exceeds its receive buffer",
+                std::logic_error);
+  KVIKIO_EXPECT(expected_destination_offset <= destination_extent,
+                "direct-receive host body cursor exceeds its destination",
+                std::logic_error);
+  if (direct_destination_buffer) {
+    KVIKIO_EXPECT(source == static_cast<std::byte*>(destination) + expected_destination_offset,
+                  "direct-receive host buffer does not begin at its final destination",
+                  std::logic_error);
+    KVIKIO_EXPECT(released.raw_bytes == released.body_bytes,
+                  "direct-receive host destination contains non-body bytes",
+                  std::logic_error);
+  }
+
+  std::size_t body_bytes{};
+  std::size_t previous_source_end{};
+  std::size_t previous_destination_end = expected_destination_offset;
+  for (std::size_t i = 0; i < released.span_count; ++i) {
+    auto const& span = released.spans[i];
+    KVIKIO_EXPECT(span.size != 0,
+                  "direct-receive host placement cannot contain an empty span",
+                  std::logic_error);
+    KVIKIO_EXPECT(span.source_offset <= released.raw_bytes &&
+                    span.size <= released.raw_bytes - span.source_offset,
+                  "direct-receive host source span exceeds received bytes",
+                  std::logic_error);
+    KVIKIO_EXPECT(span.destination_offset == previous_destination_end &&
+                    span.destination_offset <= destination_extent &&
+                    span.size <= destination_extent - span.destination_offset,
+                  "direct-receive host destination spans are not contiguous and in bounds",
+                  std::logic_error);
+    KVIKIO_EXPECT(i == 0 || span.source_offset >= previous_source_end,
+                  "direct-receive host source spans overlap or are out of order",
+                  std::logic_error);
+    KVIKIO_EXPECT(body_bytes <= std::numeric_limits<std::size_t>::max() - span.size,
+                  "direct-receive host body byte count overflow",
+                  std::logic_error);
+
+    if (direct_destination_buffer) {
+      KVIKIO_EXPECT(span.source_offset == body_bytes,
+                    "direct-receive host body is not a contiguous raw prefix",
+                    std::logic_error);
+    }
+
+    body_bytes += span.size;
+    previous_source_end      = span.source_offset + span.size;
+    previous_destination_end = span.destination_offset + span.size;
+  }
+  KVIKIO_EXPECT(body_bytes == released.body_bytes,
+                "direct-receive host span sizes do not match body bytes",
+                std::logic_error);
+  KVIKIO_EXPECT(previous_destination_end == expected_destination_offset + body_bytes,
+                "direct-receive host placement did not advance by its body bytes",
+                std::logic_error);
+
+  // All descriptors are valid before the first mutation. Copy accepted body spans out of the
+  // bounded framing window only after that validation. Direct-tail spans are already at their
+  // final offsets.
+  if (!direct_destination_buffer) {
+    for (std::size_t i = 0; i < released.span_count; ++i) {
+      auto const& span = released.spans[i];
+      std::memmove(static_cast<std::byte*>(destination) + span.destination_offset,
+                   static_cast<std::byte const*>(source) + span.source_offset,
+                   span.size);
+    }
+  }
+
+  return direct_destination_buffer ? DirectReceiveHostPlacement{.direct_bytes = body_bytes}
+                                   : DirectReceiveHostPlacement{.staged_bytes = body_bytes};
+}
 
 void DirectReceiveSpanTracker::set_buffer(void* buffer, std::size_t capacity)
 {
@@ -380,19 +468,29 @@ void CurlDirectReceiveState::configure(CurlHandle& curl, bool require_ktls)
   curl.setopt(CURLOPT_HEADERDATA, this);
 }
 
-void CurlDirectReceiveState::install_buffer(void* pinned_buffer, std::size_t capacity)
+void CurlDirectReceiveState::install_buffer(void* receive_buffer, std::size_t capacity)
 {
-  if (pinned_buffer == nullptr || capacity < DirectReceiveSlotPool::minimum_slot_size() ||
-      _pinned_buffer != nullptr || _slot_ready || _loan_outstanding || _callback_failed ||
-      body_complete()) {
+  if (capacity < DirectReceiveSlotPool::minimum_slot_size()) {
     throw std::logic_error("cannot install a direct-receive slot in the current state");
   }
-  _pinned_buffer        = pinned_buffer;
-  _capacity             = capacity;
-  _loan_buffer          = nullptr;
-  _loan_capacity        = 0;
-  _loan_body_high_water = 0;
-  _tracker.set_buffer(pinned_buffer, capacity);
+  install_buffer(receive_buffer, capacity, true);
+}
+
+void CurlDirectReceiveState::install_buffer(void* receive_buffer,
+                                            std::size_t capacity,
+                                            bool rotate_before_short_loan)
+{
+  if (receive_buffer == nullptr || capacity == 0 || _receive_buffer != nullptr || _slot_ready ||
+      _loan_outstanding || _callback_failed || body_complete()) {
+    throw std::logic_error("cannot install a direct-receive slot in the current state");
+  }
+  _receive_buffer           = receive_buffer;
+  _capacity                 = capacity;
+  _loan_buffer              = nullptr;
+  _loan_capacity            = 0;
+  _loan_body_high_water     = 0;
+  _rotate_before_short_loan = rotate_before_short_loan;
+  _tracker.set_buffer(receive_buffer, capacity);
 }
 
 bool CurlDirectReceiveState::slot_ready() const noexcept
@@ -401,12 +499,17 @@ bool CurlDirectReceiveState::slot_ready() const noexcept
 }
 bool CurlDirectReceiveState::needs_buffer() const noexcept
 {
-  return !_callback_failed && _pinned_buffer == nullptr && !_slot_ready &&
+  return !_callback_failed && _receive_buffer == nullptr && !_slot_ready &&
          body_bytes() < _requested_size;
 }
 bool CurlDirectReceiveState::body_complete() const noexcept
 {
   return body_bytes() == _requested_size;
+}
+bool CurlDirectReceiveState::response_body_accepted() const noexcept
+{
+  return _response.body_disposition(_requested_offset, _requested_size) ==
+         DirectReceiveBodyDisposition::accept_range;
 }
 
 void CurlDirectReceiveState::finalize_current_slot() noexcept
@@ -415,12 +518,12 @@ void CurlDirectReceiveState::finalize_current_slot() noexcept
     fail_callback(CallbackError::invalid_release);
     return;
   }
-  if (_pinned_buffer != nullptr && _tracker.raw_bytes() != 0) { _slot_ready = true; }
+  if (_receive_buffer != nullptr && _tracker.raw_bytes() != 0) { _slot_ready = true; }
 }
 
 DirectReceiveReleasedSlot CurlDirectReceiveState::take_released_slot()
 {
-  if (_callback_failed || !_slot_ready || _loan_outstanding || _pinned_buffer == nullptr) {
+  if (_callback_failed || !_slot_ready || _loan_outstanding || _receive_buffer == nullptr) {
     throw std::logic_error("no released direct-receive slot is ready");
   }
 
@@ -436,7 +539,7 @@ DirectReceiveReleasedSlot CurlDirectReceiveState::take_released_slot()
 
   _completed_raw_bytes += released.raw_bytes;
   _completed_body_bytes += released.body_bytes;
-  _pinned_buffer        = nullptr;
+  _receive_buffer       = nullptr;
   _capacity             = 0;
   _slot_ready           = false;
   _loan_buffer          = nullptr;
@@ -518,11 +621,11 @@ curl_recv_buffer_result CurlDirectReceiveState::acquire_buffer(std::size_t sugge
     fail_callback(CallbackError::invalid_acquire);
     return CURL_RECV_BUFFER_ERROR;
   }
-  if (_pinned_buffer == nullptr || _slot_ready || _tracker.raw_bytes() == _capacity) {
+  if (_receive_buffer == nullptr || _slot_ready || _tracker.raw_bytes() == _capacity) {
     return CURL_RECV_BUFFER_AGAIN;
   }
   (void)suggested_size;
-  auto* const next      = static_cast<std::byte*>(_pinned_buffer) + _tracker.raw_bytes();
+  auto* const next      = static_cast<std::byte*>(_receive_buffer) + _tracker.raw_bytes();
   auto const remaining  = _capacity - _tracker.raw_bytes();
   buffer->buffer        = next;
   buffer->length        = remaining;
@@ -551,7 +654,8 @@ void CurlDirectReceiveState::release_buffer(curl_recv_buffer const* buffer,
   auto const minimum_receive_size = DirectReceiveSlotPool::minimum_slot_size();
   auto const remaining            = _capacity - _tracker.raw_bytes();
   if (!_callback_failed &&
-      (remaining == 0 || (remaining < minimum_receive_size && body_bytes() < _requested_size))) {
+      (remaining == 0 || (_rotate_before_short_loan && _tracker.raw_bytes() != 0 &&
+                          remaining < minimum_receive_size && body_bytes() < _requested_size))) {
     _slot_ready = true;
   }
 }

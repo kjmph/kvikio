@@ -40,6 +40,14 @@ void expect_all_zero(kvikio::RemoteDirectReceiveStats const& stats)
   EXPECT_EQ(stats.fallback_ineligible_request, 0);
 }
 
+void expect_all_zero(kvikio::RemoteDirectReceiveHostStats const& stats)
+{
+  EXPECT_EQ(stats.strict_rx_direct_placement_bytes, 0);
+  EXPECT_EQ(stats.strict_rx_framing_compaction_bytes, 0);
+  EXPECT_EQ(stats.copied_stream_direct_placement_bytes, 0);
+  EXPECT_EQ(stats.copied_stream_framing_compaction_bytes, 0);
+}
+
 }  // namespace
 
 TEST(RemoteDirectReceiveStats, distinguishes_strict_and_copied_work)
@@ -49,6 +57,7 @@ TEST(RemoteDirectReceiveStats, distinguishes_strict_and_copied_work)
 
   kvikio::reset_remote_direct_receive_stats();
   expect_all_zero(kvikio::remote_direct_receive_stats());
+  expect_all_zero(kvikio::remote_direct_receive_host_stats());
 
   kvikio::detail::direct_receive_record_requested();
   kvikio::detail::direct_receive_record_requested();
@@ -62,6 +71,8 @@ TEST(RemoteDirectReceiveStats, distinguishes_strict_and_copied_work)
   kvikio::detail::direct_receive_record_copied_completion(401, 389);
   kvikio::detail::direct_receive_record_copied_h2d_submission(601);
   kvikio::detail::direct_receive_record_copied_h2d_submission(701, 5);
+  kvikio::detail::direct_receive_record_strict_host_completion(809, 31);
+  kvikio::detail::direct_receive_record_copied_host_completion(907, 37);
   kvikio::detail::direct_receive_record_fallback(
     DirectReceiveFallbackReason::capability_unavailable);
   kvikio::detail::direct_receive_record_fallback(DirectReceiveFallbackReason::ineligible_request);
@@ -99,8 +110,15 @@ TEST(RemoteDirectReceiveStats, distinguishes_strict_and_copied_work)
   EXPECT_EQ(stats.fallback_capability_unavailable, 1);
   EXPECT_EQ(stats.fallback_ineligible_request, 1);
 
+  auto const host_stats = kvikio::remote_direct_receive_host_stats();
+  EXPECT_EQ(host_stats.strict_rx_direct_placement_bytes, 809);
+  EXPECT_EQ(host_stats.strict_rx_framing_compaction_bytes, 31);
+  EXPECT_EQ(host_stats.copied_stream_direct_placement_bytes, 907);
+  EXPECT_EQ(host_stats.copied_stream_framing_compaction_bytes, 37);
+
   kvikio::reset_remote_direct_receive_stats();
   expect_all_zero(kvikio::remote_direct_receive_stats());
+  expect_all_zero(kvikio::remote_direct_receive_host_stats());
 }
 
 TEST(RemoteDirectReceiveStats, concurrent_recorders_do_not_lose_updates)
@@ -119,6 +137,7 @@ TEST(RemoteDirectReceiveStats, concurrent_recorders_do_not_lose_updates)
           kvikio::detail::direct_receive_record_strict_activated();
           kvikio::detail::direct_receive_record_strict_completion(3, 2);
           kvikio::detail::direct_receive_record_strict_h2d_submission(2);
+          kvikio::detail::direct_receive_record_strict_host_completion(5, 1);
           kvikio::detail::direct_receive_record_slot_acquired();
         }
       });
@@ -135,4 +154,7 @@ TEST(RemoteDirectReceiveStats, concurrent_recorders_do_not_lose_updates)
   EXPECT_EQ(stats.strict_rx_h2d_bytes, 2 * expected);
   EXPECT_EQ(stats.strict_rx_h2d_batches, expected);
   EXPECT_EQ(stats.pinned_slots_acquired, expected);
+  auto const host_stats = kvikio::remote_direct_receive_host_stats();
+  EXPECT_EQ(host_stats.strict_rx_direct_placement_bytes, 5 * expected);
+  EXPECT_EQ(host_stats.strict_rx_framing_compaction_bytes, expected);
 }

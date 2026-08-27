@@ -106,20 +106,20 @@ The even split assumes sub-ranges are spread across reactors, which holds under 
 Remote Direct Receive ``KVIKIO_REMOTE_DIRECT_RECEIVE``
 ------------------------------------------------------
 
-Controls the experimental caller-owned receive path for GPU reads. The accepted values (case-insensitive) are:
+Controls the experimental caller-owned receive path for host and GPU reads. The accepted values (case-insensitive) are:
 
   * ``OFF`` (default): Use the ordinary remote receive path.
-  * ``PREFER``: Use bounded caller-owned pinned slots for eligible reads. HTTPS starts with strict RX-kTLS and may fall back to the same streaming slot pipeline through libcurl's copied receive path only when the patched transport reports that strict activation is unavailable before accepting body bytes. Cleartext HTTP uses the explicitly accounted copied path directly. Ineligible requests retain the ordinary path.
+  * ``PREFER``: Use caller-owned receive buffers for eligible reads. GPU destinations rotate through bounded CUDA-pinned slots. Host destinations first use a bounded ordinary-memory window for response framing, copy any coalesced body bytes after validating the exact response headers, and then loan the remaining final destination directly. HTTPS starts with strict RX-kTLS and may fall back to the same streaming pipeline through libcurl's copied receive path only when the patched transport reports that strict activation is unavailable before accepting body bytes. Cleartext HTTP uses the explicitly accounted copied path directly. Ineligible requests retain the ordinary path.
   * ``REQUIRE``: Fail unless strict RX-kTLS can be requested and activates for every internal transfer. Unsupported builds and requests are rejected instead of silently benchmarking a copied path.
 
-Activation currently requires a device destination, the ``MULTI_POLL`` backend, an exact-range HTTP or S3 endpoint, and a libcurl build with KvikIO's caller-owned strict-receive API. WebHDFS, host destinations, and ``EASY_THREADPOOL`` remain on the ordinary path under ``PREFER`` and are rejected under ``REQUIRE``. Custom ``RemoteEndpoint`` implementations must explicitly report exact-range and origin-TLS capabilities. The streaming path accepts only an exact HTTP/1.1 ``206`` response with identity content encoding, matching ``Content-Length`` and ``Content-Range`` headers, and no transfer encoding.
+Activation currently requires the ``MULTI_POLL`` backend, an exact-range HTTP or S3 endpoint, and a libcurl build with KvikIO's caller-owned strict-receive API. WebHDFS and ``EASY_THREADPOOL`` remain on the ordinary path under ``PREFER`` and are rejected under ``REQUIRE``. Custom ``RemoteEndpoint`` implementations must explicitly report exact-range and origin-TLS capabilities. The streaming path accepts only an exact HTTP/1.1 ``206`` response with identity content encoding, matching ``Content-Length`` and ``Content-Range`` headers, and no transfer encoding.
 
-C++ callers may query or change the policy through ``defaults::remote_direct_receive_mode()`` and ``defaults::set_remote_direct_receive_mode()``. Configure it before starting concurrent remote I/O. Use ``remote_direct_receive_stats()`` to distinguish strict activation and completion from copied or ineligible fallback.
+C++ callers may query or change the policy through ``defaults::remote_direct_receive_mode()`` and ``defaults::set_remote_direct_receive_mode()``. Configure it before starting concurrent remote I/O. Use ``remote_direct_receive_stats()`` to distinguish strict activation and completion from copied or ineligible fallback. Use ``remote_direct_receive_host_stats()`` to distinguish host bytes received at their final offset from the bounded response-framing bytes copied out of the ordinary-memory window.
 
 Direct-Receive Slot Size ``KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE``
 -------------------------------------------------------------------
 
-Size in bytes of each portable CUDA-pinned direct-receive slot. The default is ``262144`` (256 KiB). The supported minimum is the larger of 16 KiB and ``CURL_MAX_WRITE_SIZE``; this is an intentional floor chosen to accommodate TLS records and libcurl write callbacks.
+Size in bytes of each portable CUDA-pinned direct-receive slot. The default is ``262144`` (256 KiB). The supported minimum is the larger of 16 KiB and ``CURL_MAX_WRITE_SIZE``; this is an intentional floor chosen to accommodate TLS records and libcurl write callbacks. Host reads do not allocate from this pool; their ordinary-memory response-framing window uses only the fixed supported minimum.
 
 This setting is independent of ``KVIKIO_TASK_SIZE`` and ``KVIKIO_BOUNCE_BUFFER_SIZE``. Task size controls remote range-request granularity, while the slot size bounds each reusable pinned allocation.
 

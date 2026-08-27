@@ -6,16 +6,19 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -50,11 +53,17 @@ class LocalHttpServer {
   explicit LocalHttpServer(std::string body                   = {},
                            bool exact_range                   = false,
                            std::size_t transient_failures     = 0,
-                           std::size_t pause_after_body_bytes = 0)
+                           std::size_t pause_after_body_bytes = 0,
+                           std::size_t successful_requests    = 1,
+                           bool honor_range_requests          = false,
+                           bool pause_before_body             = false)
     : _body{std::move(body)},
       _exact_range{exact_range},
       _transient_failures{transient_failures},
-      _pause_after_body_bytes{pause_after_body_bytes}
+      _pause_after_body_bytes{pause_after_body_bytes},
+      _successful_requests{successful_requests},
+      _honor_range_requests{honor_range_requests},
+      _pause_before_body{pause_before_body}
   {
     _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (_listen_fd < 0) { throw std::runtime_error(std::strerror(errno)); }
@@ -127,6 +136,15 @@ class LocalHttpServer {
     }
   }
 
+  void replace_body(std::string body)
+  {
+    std::lock_guard lock{_state_mutex};
+    if (body.size() != _body.size()) {
+      throw std::invalid_argument("replacement HTTP body must preserve Content-Length");
+    }
+    _body = std::move(body);
+  }
+
   [[nodiscard]] std::string const& request()
   {
     if (_thread.joinable()) { _thread.join(); }
@@ -145,9 +163,35 @@ class LocalHttpServer {
     return true;
   }
 
+  [[nodiscard]] static std::optional<std::pair<std::size_t, std::size_t>> requested_range(
+    std::string_view request)
+  {
+    constexpr std::string_view prefix{"Range: bytes="};
+    auto const prefix_begin = request.find(prefix);
+    if (prefix_begin == std::string_view::npos) { return std::nullopt; }
+    auto const value_begin = prefix_begin + prefix.size();
+    auto const value_end   = request.find("\r\n", value_begin);
+    if (value_end == std::string_view::npos) { return std::nullopt; }
+    auto const value = request.substr(value_begin, value_end - value_begin);
+    auto const dash  = value.find('-');
+    if (dash == std::string_view::npos) { return std::nullopt; }
+
+    std::size_t first{};
+    std::size_t last{};
+    auto const [first_end, first_error] = std::from_chars(value.data(), value.data() + dash, first);
+    auto const [last_end, last_error] =
+      std::from_chars(value.data() + dash + 1, value.data() + value.size(), last);
+    if (first_error != std::errc{} || last_error != std::errc{} ||
+        first_end != value.data() + dash || last_end != value.data() + value.size() ||
+        first > last) {
+      return std::nullopt;
+    }
+    return std::pair{first, last};
+  }
+
   void serve()
   {
-    for (std::size_t attempt = 0; attempt <= _transient_failures; ++attempt) {
+    for (std::size_t attempt = 0; attempt < _transient_failures + _successful_requests; ++attempt) {
       auto const client = ::accept(_listen_fd, nullptr, nullptr);
       if (client < 0) { return; }
       {
@@ -165,16 +209,28 @@ class LocalHttpServer {
       }
       _request += request;
 
-      auto response_header = std::string{};
+      auto response_header       = std::string{};
+      std::size_t response_first = 0;
+      std::size_t response_size  = _body.size();
       if (attempt < _transient_failures) {
         response_header =
           "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: "
           "close\r\n\r\n";
       } else if (_exact_range) {
+        if (_honor_range_requests) {
+          auto const range = requested_range(request);
+          if (!range.has_value() || range->second >= _body.size()) {
+            ::close(client);
+            return;
+          }
+          response_first = range->first;
+          response_size  = range->second - range->first + 1;
+        }
         response_header = std::string{"HTTP/1.1 206 Partial Content\r\nContent-Length: "} +
-                          std::to_string(_body.size()) + "\r\nContent-Range: bytes 0-" +
-                          std::to_string(_body.size() - 1) + "/" + std::to_string(_body.size()) +
-                          "\r\nConnection: close\r\n\r\n";
+                          std::to_string(response_size) + "\r\nContent-Range: bytes " +
+                          std::to_string(response_first) + "-" +
+                          std::to_string(response_first + response_size - 1) + "/" +
+                          std::to_string(_body.size()) + "\r\nConnection: close\r\n\r\n";
       } else {
         response_header = std::string{"HTTP/1.1 200 OK\r\nContent-Length: "} +
                           std::to_string(_body.size()) + "\r\nConnection: close\r\n\r\n";
@@ -184,18 +240,25 @@ class LocalHttpServer {
         return;
       }
       if (attempt >= _transient_failures) {
-        auto const prefix = std::min(_pause_after_body_bytes, _body.size());
-        if (!send_all(client, _body.data(), prefix)) {
-          ::close(client);
-          return;
-        }
-        if (prefix != 0 && prefix < _body.size()) {
+        if (_pause_before_body) {
           std::unique_lock lock{_state_mutex};
           _body_paused = true;
           _state_cv.notify_all();
           _state_cv.wait(lock, [this] { return _resume_body; });
         }
-        std::ignore = send_all(client, _body.data() + prefix, _body.size() - prefix);
+        auto const prefix = std::min(_pause_after_body_bytes, response_size);
+        if (!send_all(client, _body.data() + response_first, prefix)) {
+          ::close(client);
+          return;
+        }
+        if (prefix != 0 && prefix < response_size) {
+          std::unique_lock lock{_state_mutex};
+          _body_paused = true;
+          _state_cv.notify_all();
+          _state_cv.wait(lock, [this] { return _resume_body; });
+        }
+        std::ignore =
+          send_all(client, _body.data() + response_first + prefix, response_size - prefix);
       }
       ::shutdown(client, SHUT_RDWR);
       ::close(client);
@@ -210,6 +273,9 @@ class LocalHttpServer {
   bool _exact_range{};
   std::size_t _transient_failures{};
   std::size_t _pause_after_body_bytes{};
+  std::size_t _successful_requests{};
+  bool _honor_range_requests{};
+  bool _pause_before_body{};
   std::mutex _state_mutex;
   std::condition_variable _state_cv;
   bool _accepted{};
@@ -421,6 +487,7 @@ class RestoreHttpRetryPolicy {
  public:
   RestoreHttpRetryPolicy()
     : _max_attempts{kvikio::defaults::http_max_attempts()},
+      _timeout{kvikio::defaults::http_timeout()},
       _status_codes{kvikio::defaults::http_status_codes()}
   {
   }
@@ -428,11 +495,13 @@ class RestoreHttpRetryPolicy {
   ~RestoreHttpRetryPolicy()
   {
     kvikio::defaults::set_http_max_attempts(_max_attempts);
+    kvikio::defaults::set_http_timeout(_timeout);
     kvikio::defaults::set_http_status_codes(std::move(_status_codes));
   }
 
  private:
   std::size_t _max_attempts;
+  long _timeout;
   std::vector<int> _status_codes;
 };
 
@@ -710,6 +779,320 @@ TEST_F(RemoteHandleTest, multi_poll_copied_stream_rotates_one_bounded_direct_rec
 #endif
 }
 
+TEST_F(RemoteHandleTest, multi_poll_host_receive_preserves_boundaries_and_places_validated_tails)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+
+  auto const framing_size = kvikio::detail::DirectReceiveSlotPool::minimum_slot_size();
+  std::vector<std::size_t> const sizes{
+    1, framing_size - 1, framing_size, framing_size + 1, 3 * framing_size + 137};
+  constexpr std::size_t guard_size = 31;
+  constexpr char guard_value       = static_cast<char>(0x5a);
+  for (auto const body_size : sizes) {
+    std::string body(body_size, '\0');
+    for (std::size_t i = 0; i < body.size(); ++i) {
+      body[i] = static_cast<char>((i * 193U + 29U) & 0xffU);
+    }
+    LocalHttpServer server{body, true};
+    auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+    kvikio::RemoteHandle remote_handle(std::move(endpoint), body.size());
+    std::vector<char> output(body.size() + 2 * guard_size, guard_value);
+    auto* const destination = output.data() + guard_size;
+    kvikio::reset_remote_direct_receive_stats();
+
+    auto completion = remote_handle.pread(destination, body.size(), 0, body.size());
+    EXPECT_EQ(completion.get(), body.size());
+    EXPECT_TRUE(std::equal(body.begin(), body.end(), destination));
+    EXPECT_TRUE(std::all_of(output.begin(), output.begin() + guard_size, [](char value) {
+      return value == guard_value;
+    }));
+    EXPECT_TRUE(std::all_of(
+      output.end() - guard_size, output.end(), [](char value) { return value == guard_value; }));
+
+    auto const stats      = kvikio::remote_direct_receive_stats();
+    auto const host_stats = kvikio::remote_direct_receive_host_stats();
+    EXPECT_EQ(stats.transfers_requested, 1);
+    EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
+    EXPECT_EQ(stats.copied_stream_body_bytes, body.size());
+    EXPECT_EQ(stats.copied_stream_h2d_bytes, 0);
+    EXPECT_EQ(stats.pinned_slots_acquired, 0);
+    EXPECT_EQ(host_stats.copied_stream_direct_placement_bytes +
+                host_stats.copied_stream_framing_compaction_bytes,
+              body.size());
+    if (body.size() > framing_size) {
+      EXPECT_GT(host_stats.copied_stream_direct_placement_bytes, 0);
+    }
+  }
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_host_receive_waits_on_a_one_byte_direct_tail)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+
+  LocalHttpServer server{"q", true, 0, 0, 1, false, true};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), 1);
+  std::array<char, 1> output{};
+  kvikio::reset_remote_direct_receive_stats();
+
+  auto completion        = remote_handle.pread(output.data(), output.size(), 0, output.size());
+  auto const body_paused = server.wait_until_body_paused(std::chrono::seconds{5});
+  EXPECT_TRUE(body_paused);
+  if (body_paused) {
+    EXPECT_EQ(completion.wait_for(std::chrono::milliseconds{100}), std::future_status::timeout);
+  }
+  server.resume_body();
+
+  EXPECT_EQ(completion.get(), 1);
+  EXPECT_EQ(output[0], 'q');
+  auto const stats      = kvikio::remote_direct_receive_stats();
+  auto const host_stats = kvikio::remote_direct_receive_host_stats();
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
+  EXPECT_EQ(stats.pinned_slots_acquired, 0);
+  EXPECT_EQ(host_stats.copied_stream_direct_placement_bytes, 1);
+  EXPECT_EQ(host_stats.copied_stream_framing_compaction_bytes, 0);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_host_receive_places_multiple_nonzero_ranges)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+
+  auto const framing_size = kvikio::detail::DirectReceiveSlotPool::minimum_slot_size();
+  auto const task_size    = framing_size + 83;
+  auto const read_size    = 2 * task_size + 157;
+  auto const file_offset  = std::size_t{113};
+  auto const file_size    = file_offset + read_size + framing_size;
+  auto const num_ranges   = 1 + (read_size - 1) / task_size;
+  std::string body(file_size, '\0');
+  for (std::size_t i = 0; i < body.size(); ++i) {
+    body[i] = static_cast<char>((i * 157U + 41U) & 0xffU);
+  }
+  LocalHttpServer server{body, true, 0, 0, num_ranges, true};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), body.size());
+  constexpr std::size_t guard_size = 29;
+  constexpr char guard_value       = static_cast<char>(0x6d);
+  std::vector<char> output(read_size + 2 * guard_size, guard_value);
+  auto* const destination = output.data() + guard_size;
+  kvikio::reset_remote_direct_receive_stats();
+
+  auto completion = remote_handle.pread(destination, read_size, file_offset, task_size);
+  EXPECT_EQ(completion.get(), read_size);
+  EXPECT_TRUE(
+    std::equal(body.begin() + file_offset, body.begin() + file_offset + read_size, destination));
+  EXPECT_TRUE(std::all_of(
+    output.begin(), output.begin() + guard_size, [](char value) { return value == guard_value; }));
+  EXPECT_TRUE(std::all_of(
+    output.end() - guard_size, output.end(), [](char value) { return value == guard_value; }));
+
+  auto const stats      = kvikio::remote_direct_receive_stats();
+  auto const host_stats = kvikio::remote_direct_receive_host_stats();
+  EXPECT_EQ(stats.transfers_requested, num_ranges);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, num_ranges);
+  EXPECT_EQ(stats.copied_stream_body_bytes, read_size);
+  EXPECT_EQ(stats.pinned_slots_acquired, 0);
+  EXPECT_EQ(host_stats.copied_stream_direct_placement_bytes +
+              host_stats.copied_stream_framing_compaction_bytes,
+            read_size);
+  EXPECT_GT(host_stats.copied_stream_direct_placement_bytes, 0);
+
+  auto const& request = server.request();
+  EXPECT_THAT(request, HasSubstr("Range: bytes=113-"));
+  EXPECT_THAT(request, HasSubstr("Range: bytes=" + std::to_string(file_offset + task_size) + "-"));
+  EXPECT_THAT(request,
+              HasSubstr("Range: bytes=" + std::to_string(file_offset + 2 * task_size) + "-"));
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_host_failure_waits_for_sibling_destination_ownership)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  RestoreHttpRetryPolicy const restore_retry;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::defaults::set_http_max_attempts(1);
+  kvikio::defaults::set_http_status_codes({503});
+
+  auto const framing_size = kvikio::detail::DirectReceiveSlotPool::minimum_slot_size();
+  auto const task_size    = framing_size + 101;
+  auto const read_size    = 3 * task_size;
+  auto const file_offset  = std::size_t{17};
+  auto const file_size    = file_offset + read_size + framing_size;
+  std::string body(file_size, '\0');
+  for (std::size_t i = 0; i < body.size(); ++i) {
+    body[i] = static_cast<char>((i * 139U + 53U) & 0xffU);
+  }
+  // One subrange receives a terminal 503. A successful sibling remains paused after publishing a
+  // body prefix, while the third connection waits behind it in this serial test server.
+  LocalHttpServer server{body, true, 1, 257, 2, true};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), body.size());
+  constexpr std::size_t guard_size = 37;
+  constexpr char guard_value       = static_cast<char>(0x59);
+  std::vector<char> output(read_size + 2 * guard_size, guard_value);
+  auto* const destination = output.data() + guard_size;
+  kvikio::reset_remote_direct_receive_stats();
+
+  auto completion           = remote_handle.pread(destination, read_size, file_offset, task_size);
+  auto const sibling_paused = server.wait_until_body_paused(std::chrono::seconds{5});
+  EXPECT_TRUE(sibling_paused);
+  auto const failure_observed =
+    wait_until([] { return kvikio::remote_direct_receive_stats().transfers_failed == 1; },
+               std::chrono::seconds{5});
+  EXPECT_TRUE(failure_observed);
+  if (sibling_paused && failure_observed) {
+    EXPECT_EQ(completion.wait_for(std::chrono::milliseconds{100}), std::future_status::timeout);
+  }
+
+  // Always release the server and drive the aggregate terminal before the caller buffer can die,
+  // including when a test precondition above times out.
+  server.resume_body();
+  EXPECT_THROW(static_cast<void>(completion.get()), std::runtime_error);
+  EXPECT_TRUE(std::all_of(
+    output.begin(), output.begin() + guard_size, [](char value) { return value == guard_value; }));
+  EXPECT_TRUE(std::all_of(
+    output.end() - guard_size, output.end(), [](char value) { return value == guard_value; }));
+
+  auto const stats = kvikio::remote_direct_receive_stats();
+  EXPECT_EQ(stats.transfers_requested, 3);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 2);
+  EXPECT_EQ(stats.transfers_failed, 1);
+  EXPECT_EQ(stats.copied_stream_body_bytes, 2 * task_size);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_host_receive_requeues_a_retryable_http_failure)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  RestoreHttpRetryPolicy const restore_retry;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::defaults::set_http_max_attempts(2);
+  kvikio::defaults::set_http_status_codes({503});
+
+  std::string body(2 * kvikio::detail::DirectReceiveSlotPool::minimum_slot_size() + 251, 'h');
+  LocalHttpServer server{body, true, 1};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), body.size());
+  std::vector<char> output(body.size(), '\0');
+  kvikio::reset_remote_direct_receive_stats();
+
+  auto completion = remote_handle.pread(output.data(), output.size(), 0, output.size());
+  EXPECT_EQ(completion.get(), body.size());
+  EXPECT_EQ(output, std::vector<char>(body.begin(), body.end()));
+
+  auto const stats      = kvikio::remote_direct_receive_stats();
+  auto const host_stats = kvikio::remote_direct_receive_host_stats();
+  EXPECT_EQ(stats.transfers_requested, 1);
+  EXPECT_EQ(stats.retries, 1);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
+  EXPECT_EQ(stats.transfers_failed, 0);
+  EXPECT_EQ(host_stats.copied_stream_direct_placement_bytes +
+              host_stats.copied_stream_framing_compaction_bytes,
+            body.size());
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_host_retry_overwrites_an_accepted_partial_body)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  RestoreHttpRetryPolicy const restore_retry;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::defaults::set_http_max_attempts(2);
+  kvikio::defaults::set_http_timeout(1);
+
+  auto const framing_size = kvikio::detail::DirectReceiveSlotPool::minimum_slot_size();
+  auto const body_size    = 2 * framing_size + 311;
+  auto const first_prefix = framing_size + 73;
+  std::string first_body(body_size, 'x');
+  std::string final_body(body_size, '\0');
+  for (std::size_t i = 0; i < final_body.size(); ++i) {
+    final_body[i] = static_cast<char>((i * 211U + 17U) & 0xffU);
+  }
+  LocalHttpServer server{first_body, true, 0, first_prefix, 2};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), body_size);
+  constexpr std::size_t guard_size = 23;
+  constexpr char guard_value       = static_cast<char>(0x65);
+  std::vector<char> output(body_size + 2 * guard_size, guard_value);
+  auto* const destination = output.data() + guard_size;
+  kvikio::reset_remote_direct_receive_stats();
+
+  auto completion                 = remote_handle.pread(destination, body_size, 0, body_size);
+  auto const first_attempt_paused = server.wait_until_body_paused(std::chrono::seconds{5});
+  EXPECT_TRUE(first_attempt_paused);
+  auto const retry_observed =
+    first_attempt_paused &&
+    wait_until([] { return kvikio::remote_direct_receive_stats().retries == 1; },
+               std::chrono::seconds{5});
+  EXPECT_TRUE(retry_observed);
+  if (retry_observed) {
+    EXPECT_TRUE(std::all_of(
+      destination, destination + first_prefix, [](char value) { return value == 'x'; }));
+    server.replace_body(final_body);
+  }
+  // Always unblock and join the published work before the caller-owned buffer can be destroyed.
+  server.resume_body();
+
+  EXPECT_EQ(completion.get(), body_size);
+  EXPECT_TRUE(std::equal(final_body.begin(), final_body.end(), destination));
+  EXPECT_TRUE(std::all_of(
+    output.begin(), output.begin() + guard_size, [](char value) { return value == guard_value; }));
+  EXPECT_TRUE(std::all_of(
+    output.end() - guard_size, output.end(), [](char value) { return value == guard_value; }));
+
+  auto const stats      = kvikio::remote_direct_receive_stats();
+  auto const host_stats = kvikio::remote_direct_receive_host_stats();
+  EXPECT_EQ(stats.transfers_requested, 1);
+  EXPECT_EQ(stats.retries, 1);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
+  EXPECT_EQ(stats.copied_stream_body_bytes, body_size);
+  EXPECT_EQ(stats.transfers_failed, 0);
+  EXPECT_EQ(host_stats.copied_stream_direct_placement_bytes +
+              host_stats.copied_stream_framing_compaction_bytes,
+            body_size);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
 TEST_F(RemoteHandleTest, multi_poll_direct_receive_prioritizes_a_paused_read)
 {
 #if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
@@ -769,6 +1152,66 @@ TEST_F(RemoteHandleTest, multi_poll_direct_receive_prioritizes_a_paused_read)
   EXPECT_GE(stats.pinned_slots_acquired, 6);
   EXPECT_GT(stats.pinned_slot_exhaustions, 0);
   EXPECT_EQ(kvikio::detail::DirectReceiveSlotPool::instance().snapshot().checked_out_slots, 0);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_host_receive_does_not_wait_for_a_gpu_slot)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+
+  auto const slot_size = kvikio::detail::DirectReceiveSlotPool::minimum_slot_size();
+  std::string gpu_body(2 * slot_size + 137, 'g');
+  std::string host_body(2 * slot_size + 251, 'c');
+  LocalHttpServer gpu_server{gpu_body, true, 0, slot_size};
+  LocalHttpServer host_server{host_body, true};
+  auto gpu_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(gpu_server.port()) + "/gpu");
+  auto host_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(host_server.port()) + "/host");
+  kvikio::RemoteHandle gpu_handle(std::move(gpu_endpoint), gpu_body.size());
+  kvikio::RemoteHandle host_handle(std::move(host_endpoint), host_body.size());
+  kvikio::test::DevBuffer<char> gpu_output(gpu_body.size());
+  std::vector<char> host_output(host_body.size(), '\0');
+
+  kvikio::reset_remote_direct_receive_stats();
+  ScopedEventQueryGate cuda_gate;
+  auto gpu = gpu_handle.pread(gpu_output.ptr, gpu_body.size(), 0, gpu_body.size());
+  EXPECT_TRUE(gpu_server.wait_until_body_paused(std::chrono::seconds{5}));
+  EXPECT_TRUE(wait_until([] { return held_event_query_calls.load(std::memory_order_relaxed) != 0; },
+                         std::chrono::seconds{5}));
+  auto const pinned_acquisitions_before_host =
+    kvikio::remote_direct_receive_stats().pinned_slots_acquired;
+  EXPECT_GT(pinned_acquisitions_before_host, 0);
+
+  // The GPU transfer owns the sole pinned slot until its gated H2D completes. Host direct receive
+  // uses ordinary framing scratch and the caller's tail, so it must neither consume that slot nor
+  // wait behind it.
+  auto host = host_handle.pread(host_output.data(), host_body.size(), 0, host_body.size());
+  auto const host_status = host.wait_for(std::chrono::seconds{5});
+  EXPECT_EQ(host_status, std::future_status::ready);
+  EXPECT_EQ(kvikio::remote_direct_receive_stats().pinned_slots_acquired,
+            pinned_acquisitions_before_host);
+  if (host_status == std::future_status::ready) {
+    EXPECT_EQ(host.get(), host_body.size());
+    EXPECT_EQ(host_output, std::vector<char>(host_body.begin(), host_body.end()));
+  }
+
+  cuda_gate.release();
+  gpu_server.resume_body();
+  EXPECT_EQ(gpu.get(), gpu_body.size());
+  EXPECT_EQ(gpu_output.to_vector(), std::vector<char>(gpu_body.begin(), gpu_body.end()));
+  if (host_status != std::future_status::ready) {
+    EXPECT_EQ(host.get(), host_body.size());
+    EXPECT_EQ(host_output, std::vector<char>(host_body.begin(), host_body.end()));
+  }
+  EXPECT_GT(kvikio::remote_direct_receive_host_stats().copied_stream_direct_placement_bytes, 0);
 #else
   GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
 #endif
@@ -943,6 +1386,28 @@ TEST_F(RemoteHandleTest, direct_receive_require_rejects_cleartext_before_publica
   kvikio::test::DevBuffer<char> output(1);
 
   EXPECT_THAT([&] { std::ignore = remote_handle.pread(output.ptr, 1, 0, 1); },
+              ThrowsMessage<std::runtime_error>(HasSubstr("REQUIRE needs an HTTPS endpoint")));
+  EXPECT_EQ(endpoint_ptr->setopt_calls, 0);
+  EXPECT_EQ(endpoint_ptr->range_request_calls, 0);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, direct_receive_require_rejects_cleartext_host_before_publication)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::REQUIRE);
+
+  auto endpoint      = std::make_unique<CountingEndpoint>();
+  auto* endpoint_ptr = endpoint.get();
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), endpoint_ptr->file_size);
+  std::vector<char> output(1);
+
+  EXPECT_THAT([&] { std::ignore = remote_handle.pread(output.data(), 1, 0, 1); },
               ThrowsMessage<std::runtime_error>(HasSubstr("REQUIRE needs an HTTPS endpoint")));
   EXPECT_EQ(endpoint_ptr->setopt_calls, 0);
   EXPECT_EQ(endpoint_ptr->range_request_calls, 0);

@@ -62,12 +62,35 @@ struct RemoteDirectReceiveStats {
 };
 
 /**
+ * @brief Host-placement counters for the caller-owned remote receive path.
+ *
+ * This is a separate additive API so extending the experimental host path does not change the
+ * layout of `RemoteDirectReceiveStats`. Direct-placement bytes were received into their final
+ * caller-owned offset after exact response validation. Framing-compaction bytes shared a bounded
+ * receive window with HTTP framing and were copied to their final offset before the read completed.
+ * Totals include successful final attempts only and are separated by strict RX-kTLS versus copied
+ * streaming.
+ */
+struct RemoteDirectReceiveHostStats {
+  std::uint64_t strict_rx_direct_placement_bytes{};
+  std::uint64_t strict_rx_framing_compaction_bytes{};
+  std::uint64_t copied_stream_direct_placement_bytes{};
+  std::uint64_t copied_stream_framing_compaction_bytes{};
+};
+
+/**
  * @brief Take a coherent-enough snapshot of direct-receive counters.
  *
  * Individual fields are atomic, but the returned structure is not a transactional snapshot across
  * concurrent transfers. It is intended for before/after deltas around a benchmark.
  */
 [[nodiscard]] KVIKIO_EXPORT RemoteDirectReceiveStats remote_direct_receive_stats() noexcept;
+
+/**
+ * @brief Take a non-transactional snapshot of host direct-receive placement counters.
+ */
+[[nodiscard]] KVIKIO_EXPORT RemoteDirectReceiveHostStats
+remote_direct_receive_host_stats() noexcept;
 
 /**
  * @brief Reset all direct-receive counters.
