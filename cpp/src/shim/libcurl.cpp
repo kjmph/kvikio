@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -119,7 +120,16 @@ CurlHandle::CurlHandle(LibCurl::UniqueHandlePtr handle,
   detail::set_up_ca_paths(*this);
 }
 
-CurlHandle::~CurlHandle() noexcept { LibCurl::instance().retain_handle(std::move(_handle)); }
+CurlHandle::~CurlHandle() noexcept
+{
+  if (_handle) {
+    // A retained easy handle is reset before reuse, but clear its borrowed
+    // header pointer before releasing the list to make that lifetime explicit.
+    (void)curl_easy_setopt(_handle.get(), CURLOPT_HTTPHEADER, nullptr);
+  }
+  curl_slist_free_all(_http_headers);
+  LibCurl::instance().retain_handle(std::move(_handle));
+}
 
 CURL* CurlHandle::handle() noexcept { return _handle.get(); }
 
@@ -131,6 +141,17 @@ std::string CurlHandle::error_message() const
 }
 
 void CurlHandle::clear_error_message() noexcept { _errbuf[0] = 0; }
+
+void CurlHandle::append_http_header(std::string const& header)
+{
+  KVIKIO_EXPECT(!header.empty() && header.find_first_of("\r\n") == std::string::npos,
+                "HTTP header must be nonempty and contain no line break",
+                std::invalid_argument);
+  auto* const appended = curl_slist_append(_http_headers, header.c_str());
+  if (appended == nullptr) { throw std::bad_alloc{}; }
+  _http_headers = appended;
+  setopt(CURLOPT_HTTPHEADER, _http_headers);
+}
 
 void CurlHandle::perform() { perform({}); }
 

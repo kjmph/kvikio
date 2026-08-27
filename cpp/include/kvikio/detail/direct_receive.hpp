@@ -7,6 +7,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -44,6 +46,53 @@ struct DirectReceiveSpan {
 // A receive callback must never allocate. Bound each slot's retained scatter description so an
 // adversarial callback sequence cannot grow memory.
 inline constexpr std::size_t direct_receive_max_spans_per_slot = 256;
+
+// Keep entity-tag processing allocation-free in libcurl callbacks. S3 ETags
+// are substantially smaller, while oversized or malformed HTTP validators are
+// rejected before caller-owned storage is exposed to response bytes.
+inline constexpr std::size_t direct_receive_max_entity_tag_size = 1024;
+
+/**
+ * @brief Object identity shared by every range and retry of one remote handle.
+ *
+ * The first exact Range response establishes a strong entity tag. Concurrent
+ * responses must converge on the same tag before any body is accepted. Eligible
+ * later requests use it in If-Match. The expected size remains the independent
+ * catalog/HEAD proof carried by RemoteHandle.
+ */
+class DirectReceiveObjectSnapshot {
+ public:
+  DirectReceiveObjectSnapshot(std::size_t expected_size,
+                              bool require_entity_tag,
+                              bool send_if_match) noexcept;
+
+  DirectReceiveObjectSnapshot(DirectReceiveObjectSnapshot const&)            = delete;
+  DirectReceiveObjectSnapshot& operator=(DirectReceiveObjectSnapshot const&) = delete;
+
+  [[nodiscard]] std::size_t expected_size() const noexcept;
+  [[nodiscard]] bool requires_entity_tag() const noexcept;
+
+  /**
+   * @brief Learn or validate a response's strong entity tag.
+   *
+   * This method is safe to call from a noexcept libcurl callback. It performs
+   * no allocation and rejects on any synchronization failure.
+   */
+  [[nodiscard]] bool accept_entity_tag(std::optional<std::string_view> entity_tag) noexcept;
+
+  /**
+   * @brief Return the learned tag for a later If-Match request.
+   */
+  [[nodiscard]] std::optional<std::string> if_match_entity_tag() const;
+
+ private:
+  std::size_t _expected_size;
+  bool _require_entity_tag;
+  bool _send_if_match;
+  mutable std::mutex _mutex;
+  std::array<char, direct_receive_max_entity_tag_size> _entity_tag{};
+  std::size_t _entity_tag_size{};
+};
 
 /**
  * @brief Fixed-capacity description of one released receive slot ready for destination placement.
@@ -118,13 +167,20 @@ class DirectReceiveResponse {
   void consume_header(std::string_view line) noexcept;
   void reset() noexcept;
   [[nodiscard]] bool transfer_encoding_seen() const noexcept;
+  [[nodiscard]] bool is_partial_content_response() const noexcept;
   [[nodiscard]] DirectReceiveBodyDisposition body_disposition(
-    std::size_t requested_offset, std::size_t requested_size) const noexcept;
+    std::size_t requested_offset,
+    std::size_t requested_size,
+    std::size_t expected_object_size,
+    bool require_entity_tag) const noexcept;
   [[nodiscard]] std::optional<std::string> validate(long response_code,
                                                     long http_version,
                                                     curl_off_t content_length,
                                                     std::size_t requested_offset,
-                                                    std::size_t requested_size) const;
+                                                    std::size_t requested_size,
+                                                    std::size_t expected_object_size,
+                                                    bool require_entity_tag) const;
+  [[nodiscard]] std::optional<std::string_view> entity_tag() const noexcept;
 
  private:
   std::optional<std::size_t> _content_length;
@@ -132,7 +188,11 @@ class DirectReceiveResponse {
   std::optional<std::size_t> _content_range_end;
   std::optional<std::size_t> _content_range_total;
   std::optional<unsigned int> _response_code;
+  std::array<char, direct_receive_max_entity_tag_size> _entity_tag{};
+  std::size_t _entity_tag_size{};
   bool _content_range_seen{};
+  bool _entity_tag_seen{};
+  bool _entity_tag_invalid{};
   bool _content_encoding_identity{true};
   bool _transfer_encoding_seen{};
   bool _http11{};
@@ -167,7 +227,9 @@ class DirectReceiveResponse {
  */
 class CurlDirectReceiveState {
  public:
-  CurlDirectReceiveState(std::size_t requested_offset, std::size_t requested_size);
+  CurlDirectReceiveState(std::size_t requested_offset,
+                         std::size_t requested_size,
+                         std::shared_ptr<DirectReceiveObjectSnapshot> object_snapshot);
   CurlDirectReceiveState(CurlDirectReceiveState const&)            = delete;
   CurlDirectReceiveState& operator=(CurlDirectReceiveState const&) = delete;
   CurlDirectReceiveState(CurlDirectReceiveState&&)                 = delete;
@@ -187,7 +249,7 @@ class CurlDirectReceiveState {
   [[nodiscard]] bool slot_ready() const noexcept;
   [[nodiscard]] bool needs_buffer() const noexcept;
   [[nodiscard]] bool body_complete() const noexcept;
-  [[nodiscard]] bool response_body_accepted() const noexcept;
+  [[nodiscard]] bool response_body_accepted() noexcept;
   void finalize_current_slot() noexcept;
   [[nodiscard]] DirectReceiveReleasedSlot take_released_slot();
   [[nodiscard]] std::optional<std::string> validate(CurlHandle& curl) const;
@@ -237,15 +299,18 @@ class CurlDirectReceiveState {
     span_capacity_exhausted,
     transfer_encoding,
     response_not_accepted,
+    object_snapshot_mismatch,
   };
 
   void fail_callback(CallbackError error) noexcept;
   [[nodiscard]] static std::string_view callback_error_message(CallbackError error) noexcept;
+  [[nodiscard]] bool accept_response_snapshot() noexcept;
 
   void* _receive_buffer{};
   std::size_t _capacity{};
   std::size_t _requested_offset;
   std::size_t _requested_size;
+  std::shared_ptr<DirectReceiveObjectSnapshot> _object_snapshot;
   std::size_t _completed_raw_bytes{};
   std::size_t _completed_body_bytes{};
   DirectReceiveSpanTracker _tracker;
@@ -258,6 +323,8 @@ class CurlDirectReceiveState {
   std::size_t _loan_body_high_water{};
   bool _slot_ready{};
   bool _callback_failed{};
+  bool _snapshot_validation_attempted{};
+  bool _snapshot_accepted{};
   CallbackError _callback_error{CallbackError::none};
 };
 

@@ -82,6 +82,7 @@ class CurlHandle {
  private:
   char _errbuf[CURL_ERROR_SIZE];
   LibCurl::UniqueHandlePtr _handle;
+  curl_slist* _http_headers{};
 
  public:
   /**
@@ -124,6 +125,15 @@ class CurlHandle {
    * @brief Discard the recorded error message.
    */
   void clear_error_message() noexcept;
+
+  /**
+   * @brief Append one request header and retain its storage for this handle.
+   *
+   * libcurl does not copy CURLOPT_HTTPHEADER lists. Owning the complete list
+   * here lets independent endpoint authentication and conditional Range logic
+   * compose headers without borrowing cross-transfer storage.
+   */
+  void append_http_header(std::string const& header);
 
   /**
    * @brief Set option for the curl handle.

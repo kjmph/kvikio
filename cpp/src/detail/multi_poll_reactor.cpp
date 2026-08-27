@@ -795,6 +795,8 @@ void MultiPollReactor::requeue_direct_receive(
     auto const fallback_allowed           = transfer->direct_receive->fallback_allowed;
     auto const strict_activation_recorded = transfer->direct_receive->strict_activation_recorded;
     auto const uses_pinned_slots          = transfer->direct_receive->uses_pinned_slots;
+    auto const object_snapshot            = transfer->direct_receive->object_snapshot;
+    auto const if_match_applied           = transfer->direct_receive->if_match_applied;
     transfer->direct_receive->receive_slot.reset();
 
     // A CURLMSG_DONE handle has no attached connection, so curl_easy_pause() is invalid here.
@@ -811,7 +813,10 @@ void MultiPollReactor::requeue_direct_receive(
     next->strict_attempt             = strict_attempt;
     next->strict_activation_recorded = strict_activation_recorded;
     next->uses_pinned_slots          = uses_pinned_slots;
-    next->callbacks = std::make_unique<CurlDirectReceiveState>(file_offset, transfer->ctx.size);
+    next->object_snapshot            = object_snapshot;
+    next->if_match_applied           = if_match_applied;
+    next->callbacks =
+      std::make_unique<CurlDirectReceiveState>(file_offset, transfer->ctx.size, object_snapshot);
     next->callbacks->configure(*transfer->curl, strict_attempt);
     transfer->direct_receive = std::move(next);
     transfer->ready_at       = ready_at;
@@ -910,6 +915,15 @@ void MultiPollReactor::finish_direct_receive_transfers(
 
       long http_code{};
       transfer->curl->getinfo(CURLINFO_RESPONSE_CODE, &http_code);
+      if (state.object_snapshot->requires_entity_tag() && http_code == 412) {
+        record_direct_receive_failure(*transfer, true);
+        auto const message =
+          state.if_match_applied
+            ? "direct receive object changed after its ETag snapshot was established"
+            : "direct receive S3 request failed an object precondition";
+        fail_aggregate_transfer(*transfer, std::make_exception_ptr(std::runtime_error(message)));
+        continue;
+      }
       ++transfer->attempt;
       auto const outcome = transfer->retry_policy->evaluate(state.network_result,
                                                             http_code,
@@ -1081,6 +1095,14 @@ void MultiPollReactor::io_thread_main()
                 deferred_transfers.push_back(std::move(transfer));
               }
               continue;
+            }
+            auto& direct = *transfer->direct_receive;
+            if (!direct.if_match_applied) {
+              auto const entity_tag = direct.object_snapshot->if_match_entity_tag();
+              if (entity_tag.has_value()) {
+                transfer->curl->append_http_header("If-Match: " + entity_tag.value());
+                direct.if_match_applied = true;
+              }
             }
           } else
 #endif

@@ -89,7 +89,66 @@ std::optional<std::size_t> parse_size(std::string_view value) noexcept
   return parsed;
 }
 
+bool is_strong_entity_tag(std::string_view value) noexcept
+{
+  if (value.size() < 2 || value.size() > direct_receive_max_entity_tag_size ||
+      value.front() != '"' || value.back() != '"') {
+    return false;
+  }
+  // RFC 9110 entity-tag = [ weak ] opaque-tag. If-Match uses the strong
+  // comparison function, so accepting W/ here would make every conditional
+  // retry fail and would not prove object identity.
+  for (auto const value_byte : value.substr(1, value.size() - 2)) {
+    auto const byte = static_cast<unsigned char>(value_byte);
+    if (byte == 0x21 || (byte >= 0x23 && byte <= 0x7e) || byte >= 0x80) { continue; }
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
+
+DirectReceiveObjectSnapshot::DirectReceiveObjectSnapshot(std::size_t expected_size,
+                                                         bool require_entity_tag,
+                                                         bool send_if_match) noexcept
+  : _expected_size{expected_size},
+    _require_entity_tag{require_entity_tag},
+    _send_if_match{send_if_match}
+{
+}
+
+std::size_t DirectReceiveObjectSnapshot::expected_size() const noexcept { return _expected_size; }
+
+bool DirectReceiveObjectSnapshot::requires_entity_tag() const noexcept
+{
+  return _require_entity_tag;
+}
+
+bool DirectReceiveObjectSnapshot::accept_entity_tag(
+  std::optional<std::string_view> entity_tag) noexcept
+{
+  if (!_require_entity_tag) { return true; }
+  if (!entity_tag.has_value() || !is_strong_entity_tag(entity_tag.value())) { return false; }
+  try {
+    std::lock_guard const lock{_mutex};
+    if (_entity_tag_size == 0) {
+      std::copy(entity_tag->begin(), entity_tag->end(), _entity_tag.begin());
+      _entity_tag_size = entity_tag->size();
+      return true;
+    }
+    return entity_tag->size() == _entity_tag_size &&
+           std::equal(entity_tag->begin(), entity_tag->end(), _entity_tag.begin());
+  } catch (...) {
+    return false;
+  }
+}
+
+std::optional<std::string> DirectReceiveObjectSnapshot::if_match_entity_tag() const
+{
+  std::lock_guard const lock{_mutex};
+  if (!_send_if_match || _entity_tag_size == 0) { return std::nullopt; }
+  return std::string{_entity_tag.data(), _entity_tag_size};
+}
 
 DirectReceiveHostPlacement place_direct_receive_on_host(void const* source,
                                                         std::size_t source_capacity,
@@ -318,7 +377,7 @@ void DirectReceiveResponse::consume_header(std::string_view line) noexcept
       return;
     }
     _content_range_seen = true;
-    // Strictly accept: bytes <first>-<last>/<size-or-*>
+    // Strictly accept: bytes <first>-<last>/<size>
     if (value.size() < 7 || !iequals(value.substr(0, 5), "bytes") || value[5] != ' ') {
       _malformed = true;
       return;
@@ -339,14 +398,27 @@ void DirectReceiveResponse::consume_header(std::string_view line) noexcept
     }
     _content_range_start = parse_size(start);
     _content_range_end   = parse_size(end);
-    if (total != "*") { _content_range_total = parse_size(total); }
-    if (!_content_range_start.has_value() || !_content_range_end.has_value() || total.empty() ||
-        (total != "*" && !_content_range_total.has_value()) ||
+    _content_range_total = parse_size(total);
+    if (!_content_range_start.has_value() || !_content_range_end.has_value() ||
+        !_content_range_total.has_value() ||
         _content_range_start.value_or(1) > _content_range_end.value_or(0) ||
-        (_content_range_total.has_value() &&
-         _content_range_total.value() <= _content_range_end.value_or(0))) {
+        _content_range_total.value_or(0) <= _content_range_end.value_or(0)) {
       _malformed = true;
     }
+    return;
+  }
+  if (iequals(name, "ETag")) {
+    if (_entity_tag_seen) {
+      _entity_tag_invalid = true;
+      return;
+    }
+    _entity_tag_seen = true;
+    if (!is_strong_entity_tag(value)) {
+      _entity_tag_invalid = true;
+      return;
+    }
+    std::copy(value.begin(), value.end(), _entity_tag.begin());
+    _entity_tag_size = value.size();
   }
 }
 
@@ -357,7 +429,10 @@ void DirectReceiveResponse::reset() noexcept
   _content_range_end.reset();
   _content_range_total.reset();
   _response_code.reset();
+  _entity_tag_size           = 0;
   _content_range_seen        = false;
+  _entity_tag_seen           = false;
+  _entity_tag_invalid        = false;
   _content_encoding_identity = true;
   _transfer_encoding_seen    = false;
   _http11                    = false;
@@ -370,8 +445,16 @@ bool DirectReceiveResponse::transfer_encoding_seen() const noexcept
   return _transfer_encoding_seen;
 }
 
+bool DirectReceiveResponse::is_partial_content_response() const noexcept
+{
+  return _response_code == 206;
+}
+
 DirectReceiveBodyDisposition DirectReceiveResponse::body_disposition(
-  std::size_t requested_offset, std::size_t requested_size) const noexcept
+  std::size_t requested_offset,
+  std::size_t requested_size,
+  std::size_t expected_object_size,
+  bool require_entity_tag) const noexcept
 {
   if (!_header_block_complete) { return DirectReceiveBodyDisposition::undecided; }
   if (_malformed || !_response_code.has_value() || !_http11) {
@@ -387,9 +470,11 @@ DirectReceiveBodyDisposition DirectReceiveResponse::body_disposition(
       requested_size == 0 || !_content_length.has_value() ||
       _content_length.value() != requested_size || !_content_range_seen ||
       !_content_range_start.has_value() || !_content_range_end.has_value() ||
-      _content_range_start.value() != requested_offset ||
+      !_content_range_total.has_value() || _content_range_start.value() != requested_offset ||
       _content_range_end.value() < _content_range_start.value() ||
-      _content_range_end.value() - _content_range_start.value() != requested_size - 1) {
+      _content_range_end.value() - _content_range_start.value() != requested_size - 1 ||
+      _content_range_total.value() != expected_object_size ||
+      (require_entity_tag && (!_entity_tag_seen || _entity_tag_invalid || _entity_tag_size == 0))) {
     return DirectReceiveBodyDisposition::reject;
   }
   return DirectReceiveBodyDisposition::accept_range;
@@ -399,9 +484,12 @@ std::optional<std::string> DirectReceiveResponse::validate(long response_code,
                                                            long http_version,
                                                            curl_off_t content_length,
                                                            std::size_t requested_offset,
-                                                           std::size_t requested_size) const
+                                                           std::size_t requested_size,
+                                                           std::size_t expected_object_size,
+                                                           bool require_entity_tag) const
 {
-  if (body_disposition(requested_offset, requested_size) !=
+  if (body_disposition(
+        requested_offset, requested_size, expected_object_size, require_entity_tag) !=
       DirectReceiveBodyDisposition::accept_range) {
     return "direct receive rejected the response before body handoff";
   }
@@ -414,12 +502,25 @@ std::optional<std::string> DirectReceiveResponse::validate(long response_code,
     return "direct receive Content-Length does not match the requested range";
   }
   if (!_content_range_seen || !_content_range_start.has_value() ||
-      !_content_range_end.has_value() || _content_range_start.value() != requested_offset ||
+      !_content_range_end.has_value() || !_content_range_total.has_value() ||
+      _content_range_start.value() != requested_offset ||
       _content_range_end.value() < _content_range_start.value() || requested_size == 0 ||
       _content_range_end.value() - _content_range_start.value() != requested_size - 1) {
     return "direct receive Content-Range does not match the requested range";
   }
+  if (_content_range_total.value() != expected_object_size) {
+    return "direct receive Content-Range does not match the object size snapshot";
+  }
+  if (require_entity_tag && (!_entity_tag_seen || _entity_tag_invalid || _entity_tag_size == 0)) {
+    return "direct receive requires one strong ETag";
+  }
   return std::nullopt;
+}
+
+std::optional<std::string_view> DirectReceiveResponse::entity_tag() const noexcept
+{
+  if (!_entity_tag_seen || _entity_tag_invalid || _entity_tag_size == 0) { return std::nullopt; }
+  return std::string_view{_entity_tag.data(), _entity_tag_size};
 }
 
 bool direct_receive_can_fallback(bool required,
@@ -441,13 +542,21 @@ bool direct_receive_can_fallback(bool required,
 
 #if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
 
-CurlDirectReceiveState::CurlDirectReceiveState(std::size_t requested_offset,
-                                               std::size_t requested_size)
-  : _requested_offset{requested_offset}, _requested_size{requested_size}
+CurlDirectReceiveState::CurlDirectReceiveState(
+  std::size_t requested_offset,
+  std::size_t requested_size,
+  std::shared_ptr<DirectReceiveObjectSnapshot> object_snapshot)
+  : _requested_offset{requested_offset},
+    _requested_size{requested_size},
+    _object_snapshot{std::move(object_snapshot)}
 {
   if (requested_size == 0 ||
       requested_offset > std::numeric_limits<std::size_t>::max() - (requested_size - 1)) {
     throw std::invalid_argument("direct receive requires a nonempty representable byte range");
+  }
+  if (_object_snapshot == nullptr || requested_offset > _object_snapshot->expected_size() ||
+      requested_size > _object_snapshot->expected_size() - requested_offset) {
+    throw std::invalid_argument("direct receive range exceeds its object size snapshot");
   }
   _tracker.set_buffer(nullptr, 0);
 }
@@ -506,10 +615,9 @@ bool CurlDirectReceiveState::body_complete() const noexcept
 {
   return body_bytes() == _requested_size;
 }
-bool CurlDirectReceiveState::response_body_accepted() const noexcept
+bool CurlDirectReceiveState::response_body_accepted() noexcept
 {
-  return _response.body_disposition(_requested_offset, _requested_size) ==
-         DirectReceiveBodyDisposition::accept_range;
+  return accept_response_snapshot();
 }
 
 void CurlDirectReceiveState::finalize_current_slot() noexcept
@@ -559,6 +667,9 @@ std::optional<std::string> CurlDirectReceiveState::validate(CurlHandle& curl) co
   if (body_bytes() != _requested_size) {
     return "direct-receive body length does not match the requested range";
   }
+  if (!_snapshot_validation_attempted || !_snapshot_accepted) {
+    return "direct-receive response does not match the object version snapshot";
+  }
 
   long response_code{};
   long http_version{};
@@ -566,8 +677,13 @@ std::optional<std::string> CurlDirectReceiveState::validate(CurlHandle& curl) co
   curl.getinfo(CURLINFO_RESPONSE_CODE, &response_code);
   curl.getinfo(CURLINFO_HTTP_VERSION, &http_version);
   curl.getinfo(CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
-  return _response.validate(
-    response_code, http_version, content_length, _requested_offset, _requested_size);
+  return _response.validate(response_code,
+                            http_version,
+                            content_length,
+                            _requested_offset,
+                            _requested_size,
+                            _object_snapshot->expected_size(),
+                            _object_snapshot->requires_entity_tag());
 }
 
 std::size_t CurlDirectReceiveState::raw_bytes() const noexcept
@@ -583,7 +699,8 @@ bool CurlDirectReceiveState::callback_protocol_validation_failed() const noexcep
 {
   return _callback_error == CallbackError::body_length_exceeded ||
          _callback_error == CallbackError::transfer_encoding ||
-         _callback_error == CallbackError::response_not_accepted;
+         _callback_error == CallbackError::response_not_accepted ||
+         _callback_error == CallbackError::object_snapshot_mismatch;
 }
 std::string_view CurlDirectReceiveState::callback_error() const noexcept
 {
@@ -697,9 +814,12 @@ std::size_t CurlDirectReceiveState::consume_body(char* data,
   _loan_body_high_water =
     std::max(_loan_body_high_water, static_cast<std::size_t>(body_ptr - loan_base) + nbytes);
 
-  auto const disposition = _response.body_disposition(_requested_offset, _requested_size);
+  auto const disposition = _response.body_disposition(_requested_offset,
+                                                      _requested_size,
+                                                      _object_snapshot->expected_size(),
+                                                      _object_snapshot->requires_entity_tag());
   if (disposition == DirectReceiveBodyDisposition::discard) { return nbytes; }
-  if (disposition != DirectReceiveBodyDisposition::accept_range) {
+  if (disposition != DirectReceiveBodyDisposition::accept_range || !accept_response_snapshot()) {
     fail_callback(_response.transfer_encoding_seen() ? CallbackError::transfer_encoding
                                                      : CallbackError::response_not_accepted);
     return CURL_WRITEFUNC_ERROR;
@@ -714,6 +834,22 @@ std::size_t CurlDirectReceiveState::consume_body(char* data,
     return CURL_WRITEFUNC_ERROR;
   }
   return nbytes;
+}
+
+bool CurlDirectReceiveState::accept_response_snapshot() noexcept
+{
+  if (_response.body_disposition(_requested_offset,
+                                 _requested_size,
+                                 _object_snapshot->expected_size(),
+                                 _object_snapshot->requires_entity_tag()) !=
+      DirectReceiveBodyDisposition::accept_range) {
+    return false;
+  }
+  if (!_snapshot_validation_attempted) {
+    _snapshot_validation_attempted = true;
+    _snapshot_accepted             = _object_snapshot->accept_entity_tag(_response.entity_tag());
+  }
+  return _snapshot_accepted;
 }
 
 std::size_t CurlDirectReceiveState::write_header(char* data,
@@ -742,6 +878,20 @@ std::size_t CurlDirectReceiveState::consume_header(char* data,
     return CURL_WRITEFUNC_ERROR;
   }
   _response.consume_header(std::string_view{data, nbytes});
+  auto const disposition = _response.body_disposition(_requested_offset,
+                                                      _requested_size,
+                                                      _object_snapshot->expected_size(),
+                                                      _object_snapshot->requires_entity_tag());
+  if (disposition == DirectReceiveBodyDisposition::accept_range && !accept_response_snapshot()) {
+    fail_callback(CallbackError::object_snapshot_mismatch);
+    return nbytes;
+  }
+  if (disposition == DirectReceiveBodyDisposition::reject &&
+      _response.is_partial_content_response()) {
+    fail_callback(_response.transfer_encoding_seen() ? CallbackError::transfer_encoding
+                                                     : CallbackError::response_not_accepted);
+    return nbytes;
+  }
   return nbytes;
 }
 
@@ -770,6 +920,8 @@ std::string_view CurlDirectReceiveState::callback_error_message(CallbackError er
       return "direct receive does not support Transfer-Encoding";
     case CallbackError::response_not_accepted:
       return "direct receive rejected body bytes before exact Range validation";
+    case CallbackError::object_snapshot_mismatch:
+      return "direct receive response does not match the object version snapshot";
   }
   return "unknown receive callback failure";
 }

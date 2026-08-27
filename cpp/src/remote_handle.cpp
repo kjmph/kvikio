@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -449,7 +450,7 @@ void S3Endpoint::setopt(CurlHandle& curl)
 
   curl.setopt(CURLOPT_AWS_SIGV4, _aws_sigv4.c_str());
   curl.setopt(CURLOPT_USERPWD, _aws_userpwd.c_str());
-  if (_curl_header_list) { curl.setopt(CURLOPT_HTTPHEADER, _curl_header_list); }
+  if (_session_token_header.has_value()) { curl.append_http_header(_session_token_header.value()); }
 }
 
 std::string S3Endpoint::url_from_bucket_and_object(std::string bucket_name,
@@ -538,15 +539,9 @@ S3Endpoint::S3Endpoint(std::string url,
                   std::invalid_argument);
   }
   if (session_token.has_value()) {
-    // Create a Custom Curl header for the session token.
-    // The _curl_header_list created by curl_slist_append must be manually freed
-    // (see https://curl.se/libcurl/c/CURLOPT_HTTPHEADER.html)
     std::stringstream ss;
     ss << "x-amz-security-token: " << session_token.value();
-    _curl_header_list = curl_slist_append(NULL, ss.str().c_str());
-    KVIKIO_EXPECT(_curl_header_list != nullptr,
-                  "Failed to create curl header for AWS token",
-                  std::runtime_error);
+    _session_token_header = ss.str();
   }
 }
 
@@ -568,13 +563,15 @@ S3Endpoint::S3Endpoint(std::pair<std::string, std::string> bucket_and_object_nam
   KVIKIO_NVTX_FUNC_RANGE();
 }
 
-S3Endpoint::~S3Endpoint() { curl_slist_free_all(_curl_header_list); }
-
 std::string S3Endpoint::str() const { return _url; }
 
 bool S3Endpoint::supports_exact_http_range() const noexcept { return true; }
 
 bool S3Endpoint::uses_origin_tls() const noexcept { return url_uses_origin_tls(_url); }
+
+bool S3Endpoint::direct_receive_requires_entity_tag() const noexcept { return true; }
+
+bool S3Endpoint::direct_receive_sends_if_match() const noexcept { return true; }
 
 std::size_t S3Endpoint::get_file_size()
 {
@@ -625,6 +622,10 @@ bool S3PublicEndpoint::supports_exact_http_range() const noexcept { return true;
 
 bool S3PublicEndpoint::uses_origin_tls() const noexcept { return url_uses_origin_tls(_url); }
 
+bool S3PublicEndpoint::direct_receive_requires_entity_tag() const noexcept { return true; }
+
+bool S3PublicEndpoint::direct_receive_sends_if_match() const noexcept { return true; }
+
 std::size_t S3PublicEndpoint::get_file_size()
 {
   KVIKIO_NVTX_FUNC_RANGE();
@@ -661,6 +662,11 @@ bool S3EndpointWithPresignedUrl::supports_exact_http_range() const noexcept { re
 bool S3EndpointWithPresignedUrl::uses_origin_tls() const noexcept
 {
   return url_uses_origin_tls(_url);
+}
+
+bool S3EndpointWithPresignedUrl::direct_receive_requires_entity_tag() const noexcept
+{
+  return true;
 }
 
 namespace {
@@ -818,6 +824,26 @@ RemoteHandle::RemoteHandle(std::unique_ptr<RemoteEndpoint> endpoint)
   _nbytes   = endpoint->get_file_size();
   _endpoint = std::move(endpoint);
   _source   = _endpoint->str();
+}
+
+std::shared_ptr<detail::DirectReceiveObjectSnapshot>
+RemoteHandle::get_or_create_direct_receive_snapshot()
+{
+  auto snapshot = std::atomic_load_explicit(&_direct_receive_snapshot, std::memory_order_acquire);
+  if (snapshot != nullptr) { return snapshot; }
+
+  auto candidate = std::make_shared<detail::DirectReceiveObjectSnapshot>(
+    _nbytes,
+    _endpoint->direct_receive_requires_entity_tag(),
+    _endpoint->direct_receive_sends_if_match());
+  if (std::atomic_compare_exchange_strong_explicit(&_direct_receive_snapshot,
+                                                   &snapshot,
+                                                   candidate,
+                                                   std::memory_order_release,
+                                                   std::memory_order_acquire)) {
+    return candidate;
+  }
+  return snapshot;
 }
 
 RemoteEndpointType RemoteHandle::remote_endpoint_type() const noexcept
@@ -1001,6 +1027,8 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
       "remote direct receive REQUIRE needs an HTTPS endpoint",
       std::runtime_error);
   }
+  auto const direct_receive_snapshot =
+    use_direct_receive ? get_or_create_direct_receive_snapshot() : nullptr;
 
   // Everything that can reject the call is checked before the recorder exists, so a call that never
   // reaches the I/O is not observed. The bounds check above does the same.
@@ -1123,8 +1151,9 @@ std::future<std::size_t> RemoteHandle::pread(void* buf,
         direct_receive_mode == RemoteDirectReceiveMode::PREFER;
       transfer->direct_receive->strict_attempt    = direct_receive_strict_attempt;
       transfer->direct_receive->uses_pinned_slots = !is_host_mem;
-      transfer->direct_receive->callbacks =
-        std::make_unique<detail::CurlDirectReceiveState>(cur_off, subrange_size);
+      transfer->direct_receive->object_snapshot   = direct_receive_snapshot;
+      transfer->direct_receive->callbacks = std::make_unique<detail::CurlDirectReceiveState>(
+        cur_off, subrange_size, direct_receive_snapshot);
       transfer->direct_receive->callbacks->configure(*transfer->curl,
                                                      direct_receive_strict_attempt);
     } else

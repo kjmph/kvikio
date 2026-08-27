@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <initializer_list>
 #include <limits>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -22,6 +24,24 @@
 #include <kvikio/detail/direct_receive.hpp>
 #include <kvikio/detail/direct_receive_slot_pool.hpp>
 #include <kvikio/shim/libcurl.hpp>
+
+namespace {
+
+constexpr std::size_t test_object_size = 1'000'000;
+
+std::shared_ptr<kvikio::detail::DirectReceiveObjectSnapshot> generic_http_snapshot(
+  std::size_t expected_size = test_object_size)
+{
+  return std::make_shared<kvikio::detail::DirectReceiveObjectSnapshot>(expected_size, false, false);
+}
+
+std::shared_ptr<kvikio::detail::DirectReceiveObjectSnapshot> s3_snapshot(
+  std::size_t expected_size = test_object_size)
+{
+  return std::make_shared<kvikio::detail::DirectReceiveObjectSnapshot>(expected_size, true, true);
+}
+
+}  // namespace
 
 TEST(DirectReceiveHostPlacement, copies_validated_framing_spans_after_full_validation)
 {
@@ -195,29 +215,106 @@ TEST(DirectReceiveResponse, accepts_strict_http11_range_response)
   kvikio::detail::DirectReceiveResponse response;
   response.consume_header("HTTP/1.1 206 Partial Content\r\n");
   response.consume_header("Content-Length: 4096\r\n");
-  response.consume_header("Content-Range: bytes 8192-12287/100000\r\n");
+  response.consume_header("Content-Range: bytes 8192-12287/1000000\r\n");
   response.consume_header("Content-Encoding: identity\r\n");
-  EXPECT_EQ(response.body_disposition(8192, 4096),
+  EXPECT_EQ(response.body_disposition(8192, 4096, test_object_size, false),
             kvikio::detail::DirectReceiveBodyDisposition::undecided);
   response.consume_header("\r\n");
 
-  EXPECT_EQ(response.body_disposition(8192, 4096),
+  // Generic HTTP retains compatibility with exact-range servers that do not provide an ETag.
+  EXPECT_EQ(response.body_disposition(8192, 4096, test_object_size, false),
             kvikio::detail::DirectReceiveBodyDisposition::accept_range);
-  EXPECT_FALSE(response.validate(206, CURL_HTTP_VERSION_1_1, 4096, 8192, 4096).has_value());
+  EXPECT_FALSE(
+    response.validate(206, CURL_HTTP_VERSION_1_1, 4096, 8192, 4096, test_object_size, false)
+      .has_value());
+  EXPECT_FALSE(response.entity_tag().has_value());
 }
 
-TEST(DirectReceiveResponse, accepts_duplicate_length_and_unknown_range_total)
+TEST(DirectReceiveResponse, accepts_duplicate_identical_length_and_concrete_range_total)
 {
   kvikio::detail::DirectReceiveResponse response;
   response.consume_header("HTTP/1.1 206 Partial Content\r\n");
   response.consume_header("Content-Length: 32\r\n");
   response.consume_header("Content-Length: 32\r\n");
-  response.consume_header("Content-Range: bytes 8-39/*\r\n");
+  response.consume_header("Content-Range: bytes 8-39/100\r\n");
   response.consume_header("\r\n");
 
-  EXPECT_EQ(response.body_disposition(8, 32),
+  EXPECT_EQ(response.body_disposition(8, 32, 100, false),
             kvikio::detail::DirectReceiveBodyDisposition::accept_range);
-  EXPECT_FALSE(response.validate(206, CURL_HTTP_VERSION_1_1, 32, 8, 32).has_value());
+  EXPECT_FALSE(response.validate(206, CURL_HTTP_VERSION_1_1, 32, 8, 32, 100, false).has_value());
+}
+
+TEST(DirectReceiveResponse, requires_concrete_matching_object_total)
+{
+  auto disposition = [](std::string_view total, std::size_t expected_object_size) {
+    kvikio::detail::DirectReceiveResponse response;
+    response.consume_header("HTTP/1.1 206 Partial Content\r\n");
+    response.consume_header("Content-Length: 32\r\n");
+    auto const range = std::string{"Content-Range: bytes 8-39/"} + std::string{total} + "\r\n";
+    response.consume_header(range);
+    response.consume_header("\r\n");
+    return response.body_disposition(8, 32, expected_object_size, false);
+  };
+
+  using Disposition = kvikio::detail::DirectReceiveBodyDisposition;
+  EXPECT_EQ(disposition("100", 100), Disposition::accept_range);
+  EXPECT_EQ(disposition("*", 100), Disposition::reject);
+  EXPECT_EQ(disposition("101", 100), Disposition::reject);
+}
+
+TEST(DirectReceiveResponse, requires_one_strong_s3_entity_tag)
+{
+  auto disposition = [](std::initializer_list<std::string_view> entity_tags) {
+    kvikio::detail::DirectReceiveResponse response;
+    response.consume_header("HTTP/1.1 206 Partial Content\r\n");
+    response.consume_header("Content-Length: 32\r\n");
+    response.consume_header("Content-Range: bytes 8-39/100\r\n");
+    for (auto const entity_tag : entity_tags) {
+      auto const header = std::string{"ETag: "} + std::string{entity_tag} + "\r\n";
+      response.consume_header(header);
+    }
+    response.consume_header("\r\n");
+    return response.body_disposition(8, 32, 100, true);
+  };
+
+  using Disposition = kvikio::detail::DirectReceiveBodyDisposition;
+  EXPECT_EQ(disposition({"\"version-1\""}), Disposition::accept_range);
+  EXPECT_EQ(disposition({}), Disposition::reject);
+  EXPECT_EQ(disposition({"W/\"version-1\""}), Disposition::reject);
+  EXPECT_EQ(disposition({"version-1"}), Disposition::reject);
+  EXPECT_EQ(disposition({"\"version-1\"", "\"version-1\""}), Disposition::reject);
+}
+
+TEST(DirectReceiveObjectSnapshot, concurrent_ranges_converge_on_one_entity_tag)
+{
+  constexpr std::size_t num_ranges = 32;
+  auto snapshot                    = s3_snapshot(100);
+  std::array<bool, num_ranges> accepted{};
+  std::atomic<bool> start{};
+  std::vector<std::thread> ranges;
+  ranges.reserve(num_ranges);
+
+  for (std::size_t i = 0; i < num_ranges; ++i) {
+    ranges.emplace_back([&, i] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      auto const entity_tag = i % 2 == 0 ? "\"version-1\"" : "\"version-2\"";
+      accepted[i]           = snapshot->accept_entity_tag(entity_tag);
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& range : ranges) {
+    range.join();
+  }
+
+  auto const selected = snapshot->if_match_entity_tag();
+  ASSERT_TRUE(selected.has_value());
+  ASSERT_TRUE(selected == "\"version-1\"" || selected == "\"version-2\"");
+  for (std::size_t i = 0; i < num_ranges; ++i) {
+    auto const entity_tag = i % 2 == 0 ? "\"version-1\"" : "\"version-2\"";
+    EXPECT_EQ(accepted[i], entity_tag == selected.value()) << "range " << i;
+  }
 }
 
 TEST(DirectReceiveResponse, discards_redirect_body_then_accepts_final_range)
@@ -227,14 +324,14 @@ TEST(DirectReceiveResponse, discards_redirect_body_then_accepts_final_range)
   response.consume_header("Transfer-Encoding: chunked\r\n");
   response.consume_header("Content-Encoding: gzip\r\n");
   response.consume_header("\r\n");
-  EXPECT_EQ(response.body_disposition(8192, 32),
+  EXPECT_EQ(response.body_disposition(8192, 32, test_object_size, false),
             kvikio::detail::DirectReceiveBodyDisposition::discard);
 
   response.consume_header("HTTP/1.1 206 Partial Content\r\n");
   response.consume_header("Content-Length: 32\r\n");
-  response.consume_header("Content-Range: bytes 8192-8223/100000\r\n");
+  response.consume_header("Content-Range: bytes 8192-8223/1000000\r\n");
   response.consume_header("\r\n");
-  EXPECT_EQ(response.body_disposition(8192, 32),
+  EXPECT_EQ(response.body_disposition(8192, 32, test_object_size, false),
             kvikio::detail::DirectReceiveBodyDisposition::accept_range);
 }
 
@@ -244,14 +341,14 @@ TEST(DirectReceiveResponse, discards_informational_body_then_accepts_final_range
   response.consume_header("HTTP/1.1 103 Early Hints\r\n");
   response.consume_header("Link: </object>; rel=preload\r\n");
   response.consume_header("\r\n");
-  EXPECT_EQ(response.body_disposition(8, 32),
+  EXPECT_EQ(response.body_disposition(8, 32, 100, false),
             kvikio::detail::DirectReceiveBodyDisposition::discard);
 
   response.consume_header("HTTP/1.1 206 Partial Content\r\n");
   response.consume_header("Content-Length: 32\r\n");
   response.consume_header("Content-Range: bytes 8-39/100\r\n");
   response.consume_header("\r\n");
-  EXPECT_EQ(response.body_disposition(8, 32),
+  EXPECT_EQ(response.body_disposition(8, 32, 100, false),
             kvikio::detail::DirectReceiveBodyDisposition::accept_range);
 }
 
@@ -264,7 +361,7 @@ TEST(DirectReceiveResponse, rejects_authentication_challenge_bodies)
     response.consume_header(status);
     response.consume_header("Content-Length: 32\r\n");
     response.consume_header("\r\n");
-    EXPECT_EQ(response.body_disposition(8, 32), Disposition::reject);
+    EXPECT_EQ(response.body_disposition(8, 32, 100, false), Disposition::reject);
   }
 }
 
@@ -275,7 +372,7 @@ TEST(DirectReceiveResponse, rejects_malformed_status_headers_and_range_total)
     for (auto line : lines) {
       response.consume_header(line);
     }
-    return response.body_disposition(8, 32);
+    return response.body_disposition(8, 32, 100, false);
   };
 
   using Disposition = kvikio::detail::DirectReceiveBodyDisposition;
@@ -354,7 +451,8 @@ TEST(DirectReceiveResponse, rejects_full_chunked_or_encoded_responses)
     if (!test_case.extra_header.empty()) { response.consume_header(test_case.extra_header); }
     response.consume_header("\r\n");
     EXPECT_TRUE(
-      response.validate(test_case.response_code, CURL_HTTP_VERSION_1_1, 32, 8, 32).has_value());
+      response.validate(test_case.response_code, CURL_HTTP_VERSION_1_1, 32, 8, 32, 100, false)
+        .has_value());
   }
 }
 
@@ -369,13 +467,17 @@ TEST(DirectReceiveResponse, rejects_http2_and_range_metadata_mismatches)
     return response;
   };
 
-  EXPECT_TRUE(make_response().validate(206, CURL_HTTP_VERSION_2_0, 32, 8, 32).has_value());
-  EXPECT_TRUE(make_response().validate(206, CURL_HTTP_VERSION_1_1, 31, 8, 32).has_value());
-  EXPECT_TRUE(make_response().validate(206, CURL_HTTP_VERSION_1_1, 32, 9, 32).has_value());
+  EXPECT_TRUE(
+    make_response().validate(206, CURL_HTTP_VERSION_2_0, 32, 8, 32, 100, false).has_value());
+  EXPECT_TRUE(
+    make_response().validate(206, CURL_HTTP_VERSION_1_1, 31, 8, 32, 100, false).has_value());
+  EXPECT_TRUE(
+    make_response().validate(206, CURL_HTTP_VERSION_1_1, 32, 9, 32, 100, false).has_value());
 
   auto duplicate_range = make_response();
   duplicate_range.consume_header("Content-Range: bytes 8-39/100\r\n");
-  EXPECT_TRUE(duplicate_range.validate(206, CURL_HTTP_VERSION_1_1, 32, 8, 32).has_value());
+  EXPECT_TRUE(
+    duplicate_range.validate(206, CURL_HTTP_VERSION_1_1, 32, 8, 32, 100, false).has_value());
 }
 
 TEST(DirectReceiveFallback, only_pre_handoff_capability_failures_are_eligible)
@@ -424,16 +526,23 @@ std::vector<std::byte> receive_storage(std::size_t minimum_size = 0)
 
 void accept_range(kvikio::detail::CurlDirectReceiveState& state,
                   std::size_t offset,
-                  std::size_t size)
+                  std::size_t size,
+                  std::size_t expected_object_size = test_object_size,
+                  std::string_view entity_tag      = {})
 {
   auto status = std::string{"HTTP/1.1 206 Partial Content\r\n"};
   auto length = std::string{"Content-Length: "} + std::to_string(size) + "\r\n";
   auto range  = std::string{"Content-Range: bytes "} + std::to_string(offset) + "-" +
-               std::to_string(offset + size - 1) + "/1000000\r\n";
+               std::to_string(offset + size - 1) + "/" + std::to_string(expected_object_size) +
+               "\r\n";
   auto end = std::string{"\r\n"};
   ASSERT_EQ(state.consume_header(status.data(), 1, status.size()), status.size());
   ASSERT_EQ(state.consume_header(length.data(), 1, length.size()), length.size());
   ASSERT_EQ(state.consume_header(range.data(), 1, range.size()), range.size());
+  if (!entity_tag.empty()) {
+    auto header = std::string{"ETag: "} + std::string{entity_tag} + "\r\n";
+    ASSERT_EQ(state.consume_header(header.data(), 1, header.size()), header.size());
+  }
   ASSERT_EQ(state.consume_header(end.data(), 1, end.size()), end.size());
 }
 
@@ -442,7 +551,7 @@ void accept_range(kvikio::detail::CurlDirectReceiveState& state,
 TEST(CurlDirectReceiveState, loans_consecutive_regions_across_receive_cycles)
 {
   auto storage = receive_storage(2 * kvikio::detail::DirectReceiveSlotPool::minimum_slot_size());
-  kvikio::detail::CurlDirectReceiveState state{1000, 256};
+  kvikio::detail::CurlDirectReceiveState state{1000, 256, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
 
   curl_recv_buffer first{};
@@ -479,21 +588,71 @@ TEST(CurlDirectReceiveState, loans_consecutive_regions_across_receive_cycles)
 
 TEST(CurlDirectReceiveState, validates_requested_range_and_slot_installation)
 {
-  EXPECT_THROW(kvikio::detail::CurlDirectReceiveState(0, 0), std::invalid_argument);
-  EXPECT_THROW(kvikio::detail::CurlDirectReceiveState(std::numeric_limits<std::size_t>::max(), 2),
+  EXPECT_THROW(kvikio::detail::CurlDirectReceiveState(0, 0, generic_http_snapshot()),
+               std::invalid_argument);
+  EXPECT_THROW(kvikio::detail::CurlDirectReceiveState(
+                 std::numeric_limits<std::size_t>::max(), 2, generic_http_snapshot()),
+               std::invalid_argument);
+  EXPECT_THROW(kvikio::detail::CurlDirectReceiveState(0, 1, nullptr), std::invalid_argument);
+  EXPECT_THROW(kvikio::detail::CurlDirectReceiveState(9, 2, generic_http_snapshot(10)),
                std::invalid_argument);
 
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot(1)};
   auto storage = receive_storage();
   EXPECT_THROW(state.install_buffer(nullptr, storage.size()), std::logic_error);
   state.install_buffer(storage.data(), storage.size());
   EXPECT_THROW(state.install_buffer(storage.data(), storage.size()), std::logic_error);
 }
 
+TEST(CurlDirectReceiveState, shared_s3_snapshot_accepts_v1_v1_convergence)
+{
+  auto snapshot = s3_snapshot(100);
+  kvikio::detail::CurlDirectReceiveState first{0, 32, snapshot};
+  kvikio::detail::CurlDirectReceiveState second{32, 32, snapshot};
+
+  accept_range(first, 0, 32, 100, "\"version-1\"");
+  accept_range(second, 32, 32, 100, "\"version-1\"");
+
+  EXPECT_TRUE(first.response_body_accepted());
+  EXPECT_TRUE(second.response_body_accepted());
+  ASSERT_TRUE(snapshot->if_match_entity_tag().has_value());
+  EXPECT_EQ(snapshot->if_match_entity_tag().value(), "\"version-1\"");
+}
+
+TEST(CurlDirectReceiveState, shared_s3_snapshot_rejects_v1_v2_mismatch)
+{
+  auto snapshot = s3_snapshot(100);
+  kvikio::detail::CurlDirectReceiveState first{0, 32, snapshot};
+  kvikio::detail::CurlDirectReceiveState changed{32, 32, snapshot};
+
+  accept_range(first, 0, 32, 100, "\"version-1\"");
+  accept_range(changed, 32, 32, 100, "\"version-2\"");
+
+  EXPECT_TRUE(first.response_body_accepted());
+  EXPECT_FALSE(changed.response_body_accepted());
+  EXPECT_TRUE(changed.callback_failed());
+  EXPECT_TRUE(changed.callback_protocol_validation_failed());
+  EXPECT_EQ(changed.callback_error(),
+            "direct receive response does not match the object version snapshot");
+  ASSERT_TRUE(snapshot->if_match_entity_tag().has_value());
+  EXPECT_EQ(snapshot->if_match_entity_tag().value(), "\"version-1\"");
+}
+
+TEST(CurlDirectReceiveState, rejects_missing_s3_entity_tag_at_header_completion)
+{
+  kvikio::detail::CurlDirectReceiveState state{0, 32, s3_snapshot(100)};
+
+  accept_range(state, 0, 32, 100);
+
+  EXPECT_TRUE(state.callback_failed());
+  EXPECT_TRUE(state.callback_protocol_validation_failed());
+  EXPECT_FALSE(state.response_body_accepted());
+}
+
 TEST(CurlDirectReceiveState, zero_byte_release_preserves_the_ownership_fence)
 {
   auto storage = receive_storage(2 * kvikio::detail::DirectReceiveSlotPool::minimum_slot_size());
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
 
   curl_recv_buffer first{};
@@ -516,7 +675,8 @@ TEST(CurlDirectReceiveState, rejects_overflow_and_null_callback_data)
 {
   auto make_state = [] {
     auto storage = receive_storage();
-    auto state   = std::make_unique<kvikio::detail::CurlDirectReceiveState>(0, 1);
+    auto state =
+      std::make_unique<kvikio::detail::CurlDirectReceiveState>(0, 1, generic_http_snapshot());
     state->install_buffer(storage.data(), storage.size());
     return std::pair{std::move(storage), std::move(state)};
   };
@@ -558,7 +718,7 @@ TEST(CurlDirectReceiveState, rejects_overflow_and_null_callback_data)
 
 TEST(CurlDirectReceiveState, configures_the_dedicated_strict_rx_option)
 {
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot()};
   auto curl = create_curl_handle();
 
   // Configure an unrelated SSL option first. Direct receive uses its dedicated boolean option and
@@ -571,7 +731,7 @@ TEST(CurlDirectReceiveState, configures_the_dedicated_strict_rx_option)
 TEST(CurlDirectReceiveState, rejects_repeated_acquisition)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
 
   curl_recv_buffer loan{};
@@ -588,7 +748,7 @@ TEST(CurlDirectReceiveState, rejects_repeated_acquisition)
 TEST(CurlDirectReceiveState, rejects_null_acquisition_descriptor)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
 
   EXPECT_EQ(state.acquire_buffer(1, nullptr), CURL_RECV_BUFFER_ERROR);
@@ -598,7 +758,7 @@ TEST(CurlDirectReceiveState, rejects_null_acquisition_descriptor)
 TEST(CurlDirectReceiveState, rejects_mismatched_release)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
 
   curl_recv_buffer loan{};
@@ -612,7 +772,7 @@ TEST(CurlDirectReceiveState, rejects_mismatched_release)
 TEST(CurlDirectReceiveState, rotates_released_slots_with_global_destination_offsets)
 {
   auto first_storage = receive_storage(32 * 1024);
-  kvikio::detail::CurlDirectReceiveState state{10, 8};
+  kvikio::detail::CurlDirectReceiveState state{10, 8, generic_http_snapshot()};
   state.install_buffer(first_storage.data(), first_storage.size());
 
   curl_recv_buffer first{};
@@ -654,12 +814,13 @@ TEST(CurlDirectReceiveState, rotates_released_slots_with_global_destination_offs
 TEST(CurlDirectReceiveState, exact_full_final_slot_does_not_wait_for_another_buffer)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{0, storage.size()};
+  kvikio::detail::CurlDirectReceiveState state{
+    0, storage.size(), generic_http_snapshot(storage.size())};
   state.install_buffer(storage.data(), storage.size());
 
   curl_recv_buffer loan{};
   ASSERT_EQ(state.acquire_buffer(storage.size(), &loan), CURL_RECV_BUFFER_OK);
-  accept_range(state, 0, storage.size());
+  accept_range(state, 0, storage.size(), storage.size());
   ASSERT_EQ(state.consume_body(static_cast<char*>(loan.buffer), 1, storage.size()), storage.size());
   state.release_buffer(&loan, storage.size());
   ASSERT_TRUE(state.slot_ready());
@@ -678,7 +839,7 @@ TEST(CurlDirectReceiveState, exact_full_final_slot_does_not_wait_for_another_buf
 TEST(CurlDirectReceiveState, short_direct_loans_reuse_zero_byte_releases)
 {
   std::array<std::byte, 1> storage{};
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot()};
   EXPECT_THROW(state.install_buffer(storage.data(), 0), std::logic_error);
 
   // GPU pool configuration retains its TLS-record floor, while a validated host tail may be
@@ -707,7 +868,7 @@ TEST(CurlDirectReceiveState, short_direct_loans_reuse_zero_byte_releases)
 TEST(CurlDirectReceiveState, release_cannot_exclude_a_retained_body_span)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{0, 5};
+  kvikio::detail::CurlDirectReceiveState state{0, 5, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
   curl_recv_buffer loan{};
   ASSERT_EQ(state.acquire_buffer(32, &loan), CURL_RECV_BUFFER_OK);
@@ -722,7 +883,7 @@ TEST(CurlDirectReceiveState, release_cannot_exclude_a_retained_body_span)
 TEST(CurlDirectReceiveState, rejects_transfer_encoding_before_body_handoff)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot(100)};
   state.install_buffer(storage.data(), storage.size());
   curl_recv_buffer loan{};
   ASSERT_EQ(state.acquire_buffer(storage.size(), &loan), CURL_RECV_BUFFER_OK);
@@ -746,7 +907,7 @@ TEST(CurlDirectReceiveState, rejects_transfer_encoding_before_body_handoff)
 TEST(CurlDirectReceiveState, callback_failure_never_publishes_a_slot)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
   curl_recv_buffer loan{};
   ASSERT_EQ(state.acquire_buffer(storage.size(), &loan), CURL_RECV_BUFFER_OK);
@@ -766,7 +927,7 @@ TEST(CurlDirectReceiveState, callback_failure_never_publishes_a_slot)
 TEST(CurlDirectReceiveState, discarded_body_still_obeys_loan_release_fence)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{0, 1};
+  kvikio::detail::CurlDirectReceiveState state{0, 1, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
   curl_recv_buffer loan{};
   ASSERT_EQ(state.acquire_buffer(storage.size(), &loan), CURL_RECV_BUFFER_OK);
@@ -785,7 +946,7 @@ TEST(CurlDirectReceiveState, rejects_body_callback_when_fixed_span_capacity_is_e
 {
   constexpr auto span_count = kvikio::detail::direct_receive_max_spans_per_slot;
   auto storage              = receive_storage(span_count * 2 + 1);
-  kvikio::detail::CurlDirectReceiveState state{0, span_count + 1};
+  kvikio::detail::CurlDirectReceiveState state{0, span_count + 1, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
   curl_recv_buffer loan{};
   ASSERT_EQ(state.acquire_buffer(storage.size(), &loan), CURL_RECV_BUFFER_OK);
@@ -805,7 +966,7 @@ TEST(CurlDirectReceiveState, rejects_body_callback_when_fixed_span_capacity_is_e
 TEST(CurlDirectReceiveState, rejects_body_before_exact_range_headers_complete)
 {
   auto storage = receive_storage();
-  kvikio::detail::CurlDirectReceiveState state{8, 4};
+  kvikio::detail::CurlDirectReceiveState state{8, 4, generic_http_snapshot()};
   state.install_buffer(storage.data(), storage.size());
   curl_recv_buffer loan{};
   ASSERT_EQ(state.acquire_buffer(storage.size(), &loan), CURL_RECV_BUFFER_OK);

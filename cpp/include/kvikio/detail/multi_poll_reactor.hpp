@@ -217,6 +217,7 @@ struct RemoteMultiTransfer {
     bool waiting_for_slot{};
     bool network_done{};
     bool failure_recorded{};
+    bool if_match_applied{};
     bool host_buffer_is_direct_tail{};
     CURLcode network_result{CURLE_OK};
     std::size_t host_destination_offset{};
@@ -224,6 +225,7 @@ struct RemoteMultiTransfer {
     std::size_t host_staged_bytes{};
     std::size_t consumer_slots_outstanding{};
     std::exception_ptr consumer_failure;
+    std::shared_ptr<DirectReceiveObjectSnapshot> object_snapshot;
     // Lazily allocated only after network admission and not retained across retry backoff, keeping
     // ordinary host scratch bounded by active request concurrency.
     std::vector<std::byte> host_framing_buffer;

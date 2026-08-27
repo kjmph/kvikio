@@ -56,14 +56,18 @@ class LocalHttpServer {
                            std::size_t pause_after_body_bytes = 0,
                            std::size_t successful_requests    = 1,
                            bool honor_range_requests          = false,
-                           bool pause_before_body             = false)
+                           bool pause_before_body             = false,
+                           std::string entity_tag             = {},
+                           std::vector<int> response_statuses = {})
     : _body{std::move(body)},
       _exact_range{exact_range},
       _transient_failures{transient_failures},
       _pause_after_body_bytes{pause_after_body_bytes},
       _successful_requests{successful_requests},
       _honor_range_requests{honor_range_requests},
-      _pause_before_body{pause_before_body}
+      _pause_before_body{pause_before_body},
+      _entity_tag{std::move(entity_tag)},
+      _response_statuses{std::move(response_statuses)}
   {
     _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (_listen_fd < 0) { throw std::runtime_error(std::strerror(errno)); }
@@ -191,7 +195,10 @@ class LocalHttpServer {
 
   void serve()
   {
-    for (std::size_t attempt = 0; attempt < _transient_failures + _successful_requests; ++attempt) {
+    auto const request_count = _response_statuses.empty()
+                                 ? _transient_failures + _successful_requests
+                                 : _response_statuses.size();
+    for (std::size_t attempt = 0; attempt < request_count; ++attempt) {
       auto const client = ::accept(_listen_fd, nullptr, nullptr);
       if (client < 0) { return; }
       {
@@ -212,11 +219,19 @@ class LocalHttpServer {
       auto response_header       = std::string{};
       std::size_t response_first = 0;
       std::size_t response_size  = _body.size();
-      if (attempt < _transient_failures) {
+      auto const response_status =
+        _response_statuses.empty()
+          ? (attempt < _transient_failures ? 503 : (_exact_range ? 206 : 200))
+          : _response_statuses[attempt];
+      bool const send_body = response_status == 200 || response_status == 206;
+      if (response_status == 503) {
         response_header =
           "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: "
           "close\r\n\r\n";
-      } else if (_exact_range) {
+      } else if (response_status == 412) {
+        response_header =
+          "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      } else if (response_status == 206) {
         if (_honor_range_requests) {
           auto const range = requested_range(request);
           if (!range.has_value() || range->second >= _body.size()) {
@@ -230,16 +245,21 @@ class LocalHttpServer {
                           std::to_string(response_size) + "\r\nContent-Range: bytes " +
                           std::to_string(response_first) + "-" +
                           std::to_string(response_first + response_size - 1) + "/" +
-                          std::to_string(_body.size()) + "\r\nConnection: close\r\n\r\n";
-      } else {
+                          std::to_string(_body.size()) + "\r\n";
+        if (!_entity_tag.empty()) { response_header += "ETag: " + _entity_tag + "\r\n"; }
+        response_header += "Connection: close\r\n\r\n";
+      } else if (response_status == 200) {
         response_header = std::string{"HTTP/1.1 200 OK\r\nContent-Length: "} +
                           std::to_string(_body.size()) + "\r\nConnection: close\r\n\r\n";
+      } else {
+        ::close(client);
+        return;
       }
       if (!send_all(client, response_header.data(), response_header.size())) {
         ::close(client);
         return;
       }
-      if (attempt >= _transient_failures) {
+      if (send_body) {
         if (_pause_before_body) {
           std::unique_lock lock{_state_mutex};
           _body_paused = true;
@@ -276,6 +296,8 @@ class LocalHttpServer {
   std::size_t _successful_requests{};
   bool _honor_range_requests{};
   bool _pause_before_body{};
+  std::string _entity_tag;
+  std::vector<int> _response_statuses;
   std::mutex _state_mutex;
   std::condition_variable _state_cv;
   bool _accepted{};
@@ -620,24 +642,59 @@ TEST_F(RemoteHandleTest, s3_endpoint_constructor)
   EXPECT_EQ(s1.str(), s2.str());
 }
 
-TEST_F(RemoteHandleTest, s3_endpoint_forwards_explicit_session_token_for_non_sts_key)
+TEST_F(RemoteHandleTest, curl_handle_composes_and_owns_s3_request_headers)
 {
   LocalHttpServer server;
   auto const url = "http://127.0.0.1:" + std::to_string(server.port()) + "/object";
-  kvikio::S3Endpoint endpoint(
-    url, "us-east-1", "CUSTOMACCESSKEY", "secret-access-key", "explicit-session-token");
-
-  auto curl = create_curl_handle();
-  endpoint.setopt(curl);
+  auto curl      = create_curl_handle();
+  {
+    kvikio::S3Endpoint endpoint(
+      url, "us-east-1", "CUSTOMACCESSKEY", "secret-access-key", "explicit-session-token");
+    endpoint.setopt(curl);
+  }
+  curl.append_http_header("If-Match: \"snapshot-etag\"");
   curl.setopt(CURLOPT_NOBODY, 1L);
   curl.setopt(CURLOPT_PROXY, "");
   curl.perform();
 
   auto const& request = server.request();
-  std::string const expected{"x-amz-security-token: explicit-session-token\r\n"};
-  auto const first = request.find(expected);
-  ASSERT_NE(first, std::string::npos) << request;
-  EXPECT_EQ(request.find(expected, first + expected.size()), std::string::npos) << request;
+  for (auto const expected : {std::string_view{"x-amz-security-token: explicit-session-token\r\n"},
+                              std::string_view{"If-Match: \"snapshot-etag\"\r\n"}}) {
+    auto const first = request.find(expected);
+    ASSERT_NE(first, std::string::npos) << request;
+    EXPECT_EQ(request.find(expected, first + expected.size()), std::string::npos) << request;
+  }
+  auto const authorization_begin = request.find("Authorization:");
+  ASSERT_NE(authorization_begin, std::string::npos) << request;
+  auto const authorization_end = request.find("\r\n", authorization_begin);
+  ASSERT_NE(authorization_end, std::string::npos) << request;
+  auto const authorization =
+    std::string_view{request}.substr(authorization_begin, authorization_end - authorization_begin);
+  EXPECT_NE(authorization.find("if-match"), std::string_view::npos) << authorization;
+  EXPECT_NE(authorization.find("x-amz-security-token"), std::string_view::npos) << authorization;
+}
+
+TEST_F(RemoteHandleTest, endpoints_report_direct_receive_object_identity_policy)
+{
+  kvikio::HttpEndpoint http{"https://example.com/object"};
+  EXPECT_FALSE(http.direct_receive_requires_entity_tag());
+  EXPECT_FALSE(http.direct_receive_sends_if_match());
+
+  kvikio::S3Endpoint authenticated_s3{
+    "https://bucket.s3.us-east-1.amazonaws.com/object", "us-east-1", "access-key", "secret-key"};
+  EXPECT_TRUE(authenticated_s3.direct_receive_requires_entity_tag());
+  EXPECT_TRUE(authenticated_s3.direct_receive_sends_if_match());
+
+  kvikio::S3PublicEndpoint public_s3{"https://bucket.s3.us-east-1.amazonaws.com/object"};
+  EXPECT_TRUE(public_s3.direct_receive_requires_entity_tag());
+  EXPECT_TRUE(public_s3.direct_receive_sends_if_match());
+
+  kvikio::S3EndpointWithPresignedUrl presigned_s3{
+    "https://bucket.s3.us-east-1.amazonaws.com/object?"
+    "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=signature&"
+    "X-Amz-Credential=credential&X-Amz-SignedHeaders=host"};
+  EXPECT_TRUE(presigned_s3.direct_receive_requires_entity_tag());
+  EXPECT_FALSE(presigned_s3.direct_receive_sends_if_match());
 }
 
 TEST_F(RemoteHandleTest, test_http_url)
@@ -1248,6 +1305,62 @@ TEST_F(RemoteHandleTest, multi_poll_direct_receive_requeues_a_retryable_http_fai
   EXPECT_EQ(stats.retries, 1);
   EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
   EXPECT_EQ(stats.transfers_failed, 0);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_s3_retry_uses_learned_if_match_and_412_is_terminal)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  RestoreHttpRetryPolicy const restore_retry;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::defaults::set_http_max_attempts(3);
+  // A failed object-version precondition is terminal even if an application accidentally lists it
+  // among ordinary transient response codes.
+  kvikio::defaults::set_http_status_codes({412, 503});
+  kvikio::reset_remote_direct_receive_stats();
+
+  std::string body(257, 'v');
+  LocalHttpServer server{
+    body, true, 0, 0, 1, false, false, "\"snapshot-etag\"", std::vector<int>{206, 503, 412}};
+  auto endpoint = std::make_unique<kvikio::S3Endpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object",
+    "us-east-1",
+    "CUSTOMACCESSKEY",
+    "secret-access-key",
+    "explicit-session-token");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), body.size());
+  std::vector<char> output(body.size(), '\0');
+
+  auto establish_snapshot = remote_handle.pread(output.data(), body.size(), 0, body.size());
+  ASSERT_EQ(establish_snapshot.get(), body.size());
+  ASSERT_EQ(output, std::vector<char>(body.begin(), body.end()));
+
+  auto changed_object = remote_handle.pread(output.data(), body.size(), 0, body.size());
+  EXPECT_THAT([&] { std::ignore = changed_object.get(); },
+              ThrowsMessage<std::runtime_error>(HasSubstr("object changed")));
+
+  auto const& requests   = server.request();
+  auto count_occurrences = [&requests](std::string_view needle) {
+    std::size_t count{};
+    for (auto offset = requests.find(needle); offset != std::string::npos;
+         offset      = requests.find(needle, offset + needle.size())) {
+      ++count;
+    }
+    return count;
+  };
+  EXPECT_EQ(count_occurrences("If-Match: \"snapshot-etag\"\r\n"), 2);
+  EXPECT_EQ(count_occurrences("x-amz-security-token: explicit-session-token\r\n"), 3);
+
+  auto const stats = kvikio::remote_direct_receive_stats();
+  EXPECT_EQ(stats.transfers_requested, 2);
+  EXPECT_EQ(stats.retries, 1);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
+  EXPECT_EQ(stats.transfers_failed, 1);
 #else
   GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
 #endif
