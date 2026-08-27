@@ -27,10 +27,15 @@
 #include <kvikio/shim/libcurl.hpp>
 #include <kvikio/utils.hpp>
 
+extern "C" unsigned int curl_recv_buffer_build_version_v1(void);
+
 namespace kvikio {
 
 LibCurl::LibCurl()
 {
+  KVIKIO_EXPECT(curl_recv_buffer_build_version_v1() == 1U,
+                "cannot initialize libcurl - incompatible caller-owned receive-buffer ABI",
+                std::runtime_error);
   CURLcode err = curl_global_init(CURL_GLOBAL_DEFAULT);
   KVIKIO_EXPECT(err == CURLE_OK,
                 "cannot initialize libcurl - errorcode: " + std::to_string(err),
