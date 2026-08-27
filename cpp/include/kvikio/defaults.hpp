@@ -8,10 +8,12 @@
 #include <cstddef>
 #include <cstdlib>
 #include <initializer_list>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 #include <kvikio/compat_mode.hpp>
 #include <kvikio/error.hpp>
@@ -23,6 +25,10 @@
  * @brief KvikIO namespace.
  */
 namespace kvikio {
+
+namespace detail {
+class DirectReceiveSlotPool;
+}
 
 // Forward declarations of the remote-IO selector enums.
 enum class RemoteIOBackend : uint8_t;
@@ -137,12 +143,22 @@ class defaults {
   unsigned int _remote_io_num_reactors;
   RemoteReactorDispatch _remote_io_reactor_dispatch;
   std::size_t _remote_io_max_concurrent_requests;
+  std::size_t _remote_direct_receive_slot_size;
+  std::size_t _remote_direct_receive_max_pinned_bytes;
+  mutable std::mutex _remote_direct_receive_slot_pool_config_mutex;
+  bool _remote_direct_receive_slot_pool_config_frozen{false};
+
+  friend class detail::DirectReceiveSlotPool;
 
   static unsigned int get_num_threads_from_env();
 
   defaults();
 
   KVIKIO_EXPORT static defaults* instance();
+
+  // Atomically snapshot and freeze the resource configuration used by the KvikIO-wide direct
+  // receive slot pool. Only DirectReceiveSlotPool may call this.
+  static std::pair<std::size_t, std::size_t> freeze_remote_direct_receive_slot_pool_configuration();
 
  public:
   /**
@@ -520,6 +536,39 @@ class defaults {
    * @return The configured concurrent-request ceiling, or 0 for unlimited.
    */
   [[nodiscard]] static std::size_t remote_io_max_concurrent_requests();
+
+  /**
+   * @brief Size of each portable CUDA-pinned direct-receive streaming slot.
+   *
+   * Controlled by `KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE`. Defaults to 256 KiB. This is
+   * independent of `KVIKIO_TASK_SIZE` and `KVIKIO_BOUNCE_BUFFER_SIZE`.
+   */
+  [[nodiscard]] static std::size_t remote_direct_receive_slot_size();
+
+  /**
+   * @brief Set the direct-receive slot size before the production pool is initialized.
+   *
+   * @throws std::logic_error if the direct-receive slot pool configuration is already frozen.
+   * @throws std::invalid_argument if `nbytes` is below the supported minimum or exceeds the
+   * configured pinned-byte ceiling.
+   */
+  static void set_remote_direct_receive_slot_size(std::size_t nbytes);
+
+  /**
+   * @brief Exact KvikIO-wide ceiling for requested direct-receive CUDA-pinned slot bytes.
+   *
+   * Controlled by `KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES`. Defaults to 512 MiB. A
+   * quarantined slot remains charged against this ceiling.
+   */
+  [[nodiscard]] static std::size_t remote_direct_receive_max_pinned_bytes();
+
+  /**
+   * @brief Set the direct-receive pinned-byte ceiling before the production pool is initialized.
+   *
+   * @throws std::logic_error if the direct-receive slot pool configuration is already frozen.
+   * @throws std::invalid_argument if `nbytes` cannot hold one complete configured slot.
+   */
+  static void set_remote_direct_receive_max_pinned_bytes(std::size_t nbytes);
 };
 
 }  // namespace kvikio

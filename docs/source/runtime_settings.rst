@@ -103,6 +103,22 @@ The global budget is divided into a private share per reactor, so each reactor e
 
 The even split assumes sub-ranges are spread across reactors, which holds under ``PER_CHUNK``. Under ``PER_PREAD`` all sub-ranges of one large :py:func:`kvikio.RemoteFile.pread` land on a single reactor, so that read is effectively limited to one reactor's share while the others stay idle.
 
+Direct-Receive Slot Size ``KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE``
+-------------------------------------------------------------------
+
+Size in bytes of each portable CUDA-pinned direct-receive slot. The default is ``262144`` (256 KiB). The supported minimum is the larger of 16 KiB and ``CURL_MAX_WRITE_SIZE``; this is an intentional floor chosen to accommodate TLS records and libcurl write callbacks.
+
+This setting is independent of ``KVIKIO_TASK_SIZE`` and ``KVIKIO_BOUNCE_BUFFER_SIZE``. Task size controls remote range-request granularity, while the slot size bounds each reusable pinned allocation.
+
+Direct-Receive Pinned-Memory Cap ``KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES``
+-----------------------------------------------------------------------------------
+
+Exact ceiling for requested bytes in portable CUDA-pinned direct-receive slots owned by this loaded KvikIO library. The default is ``536870912`` (512 MiB), and the value must hold at least one complete slot. CUDA may round individual pinned allocations internally. Slots are allocated lazily, so configuring or initializing the pool alone pins no memory. If the cap is not an exact multiple of the slot size, the remainder is left unused rather than allocating a partial slot.
+
+The slot size and byte cap are captured and frozen together when the production direct-receive slot pool is first obtained. C++ callers may set them through ``defaults::set_remote_direct_receive_slot_size()`` and ``defaults::set_remote_direct_receive_max_pinned_bytes()`` before that point; later changes are rejected. Configure them before starting concurrent remote I/O.
+
+The byte cap is separate from ``KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS``. Increasing remote concurrency therefore does not implicitly pin more host memory. A slot whose asynchronous reuse fence cannot be established is quarantined permanently and remains charged against the cap; uncertain storage is never recycled or replaced beyond the configured ceiling.
+
 CA bundle file and CA directory ``CURL_CA_BUNDLE``, ``SSL_CERT_FILE``, ``SSL_CERT_DIR``
 ---------------------------------------------------------------------------------------
 

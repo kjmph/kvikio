@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -12,6 +13,7 @@
 
 #include <kvikio/compat_mode.hpp>
 #include <kvikio/defaults.hpp>
+#include <kvikio/detail/direct_receive_slot_pool.hpp>
 #include <kvikio/detail/nvtx.hpp>
 #include <kvikio/detail/utils.hpp>
 #include <kvikio/error.hpp>
@@ -22,6 +24,35 @@
 #include <string_view>
 
 namespace kvikio {
+namespace {
+
+constexpr std::size_t default_direct_receive_slot_size        = 256 * 1024;
+constexpr std::size_t default_direct_receive_max_pinned_bytes = 512 * 1024 * 1024;
+
+std::size_t minimum_direct_receive_slot_size() noexcept
+{
+#if defined(KVIKIO_LIBCURL_FOUND)
+  return detail::DirectReceiveSlotPool::minimum_slot_size();
+#else
+  return 16 * 1024;
+#endif
+}
+
+void validate_direct_receive_slot_pool_configuration(std::size_t slot_size,
+                                                     std::size_t max_pinned_bytes)
+{
+  KVIKIO_EXPECT(slot_size >= minimum_direct_receive_slot_size(),
+                "KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE is smaller than the minimum receive "
+                "callback/TLS record size",
+                std::invalid_argument);
+  KVIKIO_EXPECT(max_pinned_bytes >= slot_size,
+                "KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES must hold at least one complete "
+                "direct-receive slot",
+                std::invalid_argument);
+}
+
+}  // namespace
+
 template <>
 bool getenv_or(std::string_view env_var_name, bool default_val)
 {
@@ -182,6 +213,23 @@ defaults::defaults()
       std::invalid_argument);
     _remote_io_max_concurrent_requests = static_cast<std::size_t>(env);
   }
+  {
+    ssize_t const slot_size = getenv_or("KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE",
+                                        static_cast<ssize_t>(default_direct_receive_slot_size));
+    ssize_t const max_pinned_bytes =
+      getenv_or("KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES",
+                static_cast<ssize_t>(default_direct_receive_max_pinned_bytes));
+    KVIKIO_EXPECT(slot_size > 0,
+                  "KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE has to be a positive integer",
+                  std::invalid_argument);
+    KVIKIO_EXPECT(max_pinned_bytes > 0,
+                  "KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES has to be a positive integer",
+                  std::invalid_argument);
+    validate_direct_receive_slot_pool_configuration(static_cast<std::size_t>(slot_size),
+                                                    static_cast<std::size_t>(max_pinned_bytes));
+    _remote_direct_receive_slot_size        = static_cast<std::size_t>(slot_size);
+    _remote_direct_receive_max_pinned_bytes = static_cast<std::size_t>(max_pinned_bytes);
+  }
 }
 
 defaults* defaults::instance()
@@ -312,5 +360,51 @@ RemoteReactorDispatch defaults::remote_io_reactor_dispatch()
 std::size_t defaults::remote_io_max_concurrent_requests()
 {
   return instance()->_remote_io_max_concurrent_requests;
+}
+
+std::size_t defaults::remote_direct_receive_slot_size()
+{
+  auto* config = instance();
+  std::lock_guard const lock(config->_remote_direct_receive_slot_pool_config_mutex);
+  return config->_remote_direct_receive_slot_size;
+}
+
+void defaults::set_remote_direct_receive_slot_size(std::size_t nbytes)
+{
+  auto* config = instance();
+  std::lock_guard const lock(config->_remote_direct_receive_slot_pool_config_mutex);
+  KVIKIO_EXPECT(!config->_remote_direct_receive_slot_pool_config_frozen,
+                "direct-receive slot-pool configuration is frozen after first use",
+                std::logic_error);
+  validate_direct_receive_slot_pool_configuration(nbytes,
+                                                  config->_remote_direct_receive_max_pinned_bytes);
+  config->_remote_direct_receive_slot_size = nbytes;
+}
+
+std::size_t defaults::remote_direct_receive_max_pinned_bytes()
+{
+  auto* config = instance();
+  std::lock_guard const lock(config->_remote_direct_receive_slot_pool_config_mutex);
+  return config->_remote_direct_receive_max_pinned_bytes;
+}
+
+void defaults::set_remote_direct_receive_max_pinned_bytes(std::size_t nbytes)
+{
+  auto* config = instance();
+  std::lock_guard const lock(config->_remote_direct_receive_slot_pool_config_mutex);
+  KVIKIO_EXPECT(!config->_remote_direct_receive_slot_pool_config_frozen,
+                "direct-receive slot-pool configuration is frozen after first use",
+                std::logic_error);
+  validate_direct_receive_slot_pool_configuration(config->_remote_direct_receive_slot_size, nbytes);
+  config->_remote_direct_receive_max_pinned_bytes = nbytes;
+}
+
+std::pair<std::size_t, std::size_t> defaults::freeze_remote_direct_receive_slot_pool_configuration()
+{
+  auto* config = instance();
+  std::lock_guard const lock(config->_remote_direct_receive_slot_pool_config_mutex);
+  config->_remote_direct_receive_slot_pool_config_frozen = true;
+  return {config->_remote_direct_receive_slot_size,
+          config->_remote_direct_receive_max_pinned_bytes};
 }
 }  // namespace kvikio
