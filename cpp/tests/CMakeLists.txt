@@ -171,6 +171,7 @@ kvikio_add_nsys_plugin_test(
 )
 
 if(KvikIO_REMOTE_SUPPORT)
+  kvikio_add_test(NAME DIRECT_RECEIVE_CUDA_TEST SOURCES test_direct_receive_cuda.cpp)
   kvikio_add_test(NAME DIRECT_RECEIVE_SLOT_POOL_TEST SOURCES test_direct_receive_slot_pool.cpp)
   kvikio_add_test(NAME HTTP_RETRY_TEST SOURCES test_http_retry.cpp utils/env.cpp)
   kvikio_add_test(NAME DIRECT_RECEIVE_TEST SOURCES test_direct_receive.cpp)

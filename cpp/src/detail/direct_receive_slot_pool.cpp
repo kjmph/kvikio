@@ -164,6 +164,75 @@ void DirectReceiveSlotPool::Slot::reset() noexcept
   _state.reset();
 }
 
+void DirectReceiveSlotPool::Slot::quarantine_after_failed_sync() noexcept
+{
+  if (_data == nullptr) { return; }
+  // Detach the allocation before accounting or logging. A failed CUDA fence means this source
+  // must never be recycled, even if defensive bookkeeping itself fails.
+  auto* data = std::exchange(_data, nullptr);
+  auto state = std::move(_state);
+  try {
+    state->quarantine(data);
+  } catch (...) {
+    // `data` is already unreachable and therefore remains safely leaked.
+  }
+}
+
+void DirectReceiveSlotPool::recycle_completed(std::span<Slot> slots) noexcept
+{
+  State* owner{};
+  for (auto const& slot : slots) {
+    if (!slot) { continue; }
+    if (owner == nullptr) {
+      owner = slot._state.get();
+    } else if (owner != slot._state.get()) {
+      // Mixed isolated pools are valid in tests and future internal consumers. Preserve ownership
+      // by using each slot's ordinary self-contained return path.
+      for (auto& mixed_slot : slots) {
+        mixed_slot.reset();
+      }
+      return;
+    }
+  }
+  if (owner == nullptr) { return; }
+
+  auto state = [&slots] {
+    for (auto const& slot : slots) {
+      if (slot) { return slot._state; }
+    }
+    return std::shared_ptr<State>{};
+  }();
+
+  void* head{};
+  void* tail{};
+  std::size_t count{};
+  for (auto& slot : slots) {
+    if (!slot) { continue; }
+    auto* data = std::exchange(slot._data, nullptr);
+    slot._state.reset();
+    *static_cast<void**>(data) = head;
+    head                       = data;
+    if (tail == nullptr) { tail = data; }
+    ++count;
+  }
+
+  try {
+    std::lock_guard const lock(state->mutex);
+    if (state->checked_out_slots < count) {
+      log_error_noexcept("direct-receive slot pool bulk accounting underflow; leaking slots");
+      return;
+    }
+    *static_cast<void**>(tail) = state->free_head;
+    state->free_head           = head;
+    state->checked_out_slots -= count;
+    state->free_slots += count;
+  } catch (...) {
+    // Every slot was detached before bookkeeping. If the lock or accounting path fails, the
+    // allocations remain unreachable and capacity-charged instead of becoming unsafely reusable.
+    log_error_noexcept("direct-receive bulk slot recycling failed; leaking the allocations");
+  }
+}
+
 DirectReceiveSlotPool::DirectReceiveSlotPool(std::size_t slot_size, std::size_t max_pinned_bytes)
 {
   validate_configuration(slot_size, max_pinned_bytes);
@@ -232,16 +301,7 @@ void DirectReceiveSlotPool::quarantine_after_failed_sync(Slot&& slot) noexcept
 {
   if (!slot) { return; }
   auto const foreign_pool = slot._state.get() != _state.get();
-  // Detach the allocation before locking or logging. A failed CUDA fence means this source must
-  // never be recycled, including in the defensive foreign-pool case.
-  auto* data = std::exchange(slot._data, nullptr);
-  auto state = std::move(slot._state);
-  try {
-    state->quarantine(data);
-  } catch (...) {
-    // `data` is already unreachable and therefore remains safely leaked if accounting cannot be
-    // updated. Preserve noexcept cleanup semantics.
-  }
+  slot.quarantine_after_failed_sync();
   if (foreign_pool) {
     log_error_noexcept("quarantined a direct-receive slot owned by another receive pool");
   }

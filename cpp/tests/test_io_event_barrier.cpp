@@ -157,6 +157,65 @@ TEST_F(IoEventBarrierTest, single_thread_record_and_sync)
   KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
 }
 
+TEST_F(IoEventBarrierTest, split_prepare_and_record_uses_the_reserved_event)
+{
+  kvikio::detail::IoEventBarrier barrier(current_context());
+
+  CUstream stream{};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&stream, CU_STREAM_DEFAULT));
+
+  EXPECT_THROW(barrier.record_prepared_event(stream), std::logic_error);
+  EXPECT_NO_THROW({
+    barrier.prepare_event(stream);
+    barrier.prepare_event(stream);
+    barrier.record_prepared_event(stream);
+    barrier.sync_all_events();
+  });
+
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(stream));
+}
+
+TEST_F(IoEventBarrierTest, split_prepare_is_bound_to_the_exact_stream)
+{
+  kvikio::detail::IoEventBarrier barrier(current_context());
+
+  CUstream first{};
+  CUstream second{};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&first, CU_STREAM_DEFAULT));
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&second, CU_STREAM_DEFAULT));
+
+  barrier.prepare_event(first);
+  EXPECT_THROW(barrier.record_prepared_event(second), std::logic_error);
+  EXPECT_NO_THROW({
+    barrier.record_prepared_event(first);
+    barrier.sync_all_events();
+  });
+
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(first));
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(second));
+}
+
+TEST_F(IoEventBarrierTest, same_thread_records_distinct_events_for_distinct_streams)
+{
+  kvikio::detail::IoEventBarrier barrier(current_context());
+
+  CUstream first{};
+  CUstream second{};
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&first, CU_STREAM_DEFAULT));
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&second, CU_STREAM_DEFAULT));
+  barrier.record_event(first);
+  barrier.record_event(second);
+
+  {
+    ScopedEventSynchronizeCounter const counter;
+    EXPECT_NO_THROW(barrier.sync_all_events());
+    EXPECT_EQ(event_synchronize_calls.load(), 2);
+  }
+
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(first));
+  KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamDestroy(second));
+}
+
 TEST_F(IoEventBarrierTest, failed_record_is_abandoned_and_forces_context_fence)
 {
   kvikio::detail::IoEventBarrier barrier(current_context());
@@ -249,8 +308,8 @@ TEST_F(IoEventBarrierTest, re_record_overwrites_same_slot)
   CUstream stream{};
   KVIKIO_CUDA_DRIVER_TRY(kvikio::cudaAPI::instance().StreamCreate(&stream, CU_STREAM_DEFAULT));
 
-  // Multiple records on the same thread reuse the same slot. sync_all_events should still succeed
-  // after the final re-record.
+  // Multiple records on the same thread and stream reuse the same slot. sync_all_events should
+  // still succeed after the final re-record.
   EXPECT_NO_THROW({
     barrier.record_event(stream);
     barrier.record_event(stream);

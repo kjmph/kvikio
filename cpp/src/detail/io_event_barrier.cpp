@@ -44,29 +44,40 @@ IoEventBarrier::IoEventBarrier(CUcontext cuda_context) noexcept : _cuda_context{
 
 CUcontext IoEventBarrier::cuda_context() const noexcept { return _cuda_context; }
 
-void IoEventBarrier::record_event(CUstream stream)
+void IoEventBarrier::prepare_event(CUstream stream)
 {
-  CudaEventPool::CudaEvent* event_ptr{nullptr};
-  auto const tid = std::this_thread::get_id();
+  auto const key = EventKey{std::this_thread::get_id(), stream};
   {
     std::lock_guard const lock(_mutex);
-    if (auto it = _thread_events.find(tid); it != _thread_events.end()) {
-      if (it->second.get() != nullptr) {
-        event_ptr = &it->second;
-      } else {
-        _thread_events.erase(it);
-      }
+    if (auto it = _events.find(key); it != _events.end()) {
+      if (it->second.get() != nullptr) { return; }
+      _events.erase(it);
     }
   }
 
-  if (event_ptr == nullptr) {
-    auto event = CudaEventPool::instance().get();
-    {
-      std::lock_guard const lock(_mutex);
-      auto [it, inserted] = _thread_events.emplace(tid, std::move(event));
-      KVIKIO_EXPECT(inserted, "New event insertion failed unexpectedly.");
-      event_ptr = &it->second;
-    }
+  auto event = CudaEventPool::instance().get();
+  std::lock_guard const lock(_mutex);
+  // Retain the second check because another caller can prepare the same pair while CUDA creates the
+  // event outside the barrier mutex.
+  if (auto it = _events.find(key); it != _events.end()) {
+    if (it->second.get() != nullptr) { return; }
+    _events.erase(it);
+  }
+  auto [_, inserted] = _events.emplace(key, std::move(event));
+  KVIKIO_EXPECT(inserted, "New event insertion failed unexpectedly.");
+}
+
+void IoEventBarrier::record_prepared_event(CUstream stream)
+{
+  CudaEventPool::CudaEvent* event_ptr{nullptr};
+  auto const key = EventKey{std::this_thread::get_id(), stream};
+  {
+    std::lock_guard const lock(_mutex);
+    auto const it = _events.find(key);
+    KVIKIO_EXPECT(it != _events.end() && it->second.get() != nullptr,
+                  "No CUDA event was prepared for this thread and stream.",
+                  std::logic_error);
+    event_ptr = &it->second;
   }
 
   // Note that for the node-based unordered_map, pointers (or references) to either key or data
@@ -81,14 +92,20 @@ void IoEventBarrier::record_event(CUstream stream)
     event_ptr->abandon();
     try {
       std::lock_guard const lock(_mutex);
-      auto it = _thread_events.find(tid);
-      if (it != _thread_events.end() && &it->second == event_ptr) { _thread_events.erase(it); }
+      auto it = _events.find(key);
+      if (it != _events.end() && &it->second == event_ptr) { _events.erase(it); }
     } catch (...) {
       // The abandoned map entry owns no CUDA handle and can be removed on the next record. Preserve
       // the event-record failure as the primary error.
     }
     std::rethrow_exception(record_error);
   }
+}
+
+void IoEventBarrier::record_event(CUstream stream)
+{
+  prepare_event(stream);
+  record_prepared_event(stream);
 }
 
 void IoEventBarrier::mark_completion_unknown() noexcept
@@ -106,7 +123,7 @@ void IoEventBarrier::sync_all_events()
       // every fence. Aggregate completion precedes this call, so the lock is uncontended in normal
       // operation and reactors can no longer add records.
       std::lock_guard const lock(_mutex);
-      for (auto& [tid, event] : _thread_events) {
+      for (auto& [key, event] : _events) {
         try {
           event.synchronize();
         } catch (...) {

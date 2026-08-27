@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <span>
 
 #include <kvikio/shim/utils.hpp>
 
@@ -78,6 +79,15 @@ class DirectReceiveSlotPool {
      */
     void reset() noexcept;
 
+    /**
+     * @brief Permanently quarantine this slot after a CUDA lifetime fence fails.
+     *
+     * The allocation remains charged against its owning pool's configured byte ceiling but can
+     * never be acquired again. This self-contained form is safe even when the pool object that
+     * issued the slot is no longer directly available.
+     */
+    void quarantine_after_failed_sync() noexcept;
+
    private:
     friend class DirectReceiveSlotPool;
     Slot(std::shared_ptr<State> state, void* data) noexcept;
@@ -114,6 +124,16 @@ class DirectReceiveSlotPool {
    * permanent quarantine exhaustion as terminal rather than retrying indefinitely.
    */
   [[nodiscard]] KVIKIO_EXPORT std::optional<Slot> try_acquire();
+
+  /**
+   * @brief Return a completed group of slots to their owning pool.
+   *
+   * Slots from one pool are linked and returned under one mutex acquisition. Empty slots are
+   * ignored. A mixed-owner range safely falls back to individual recycling.
+   *
+   * The caller must already have established that no asynchronous user can access any live slot.
+   */
+  KVIKIO_EXPORT static void recycle_completed(std::span<Slot> slots) noexcept;
 
   /**
    * @brief Permanently quarantine a slot whose asynchronous reuse fence could not be established.

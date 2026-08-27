@@ -197,6 +197,7 @@ if(KvikIO_REMOTE_SUPPORT)
     "src/hdfs.cpp"
     "src/remote_handle.cpp"
     "src/detail/direct_receive.cpp"
+    "src/detail/direct_receive_cuda.cpp"
     "src/detail/direct_receive_slot_pool.cpp"
     "src/detail/http_retry.cpp"
     "src/detail/multi_poll_reactor.cpp"

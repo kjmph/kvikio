@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -21,9 +22,9 @@ namespace kvikio::detail {
  * @brief Per-pread barrier that lets the caller's thread wait for every reactor's H2D to finish.
  *
  * Constructed once per device-path `RemoteHandle::pread` and shared via `std::shared_ptr` with all
- * of that pread's sub-range transfers. Each reactor I/O thread records into its own slot (keyed by
- * thread id) after every `cuMemcpyAsync`, re-recording the same event on later calls. Once all
- * sub-ranges report completion, the caller calls `sync_all_events()` to block until each thread's
+ * of that pread's sub-range transfers. Each reactor I/O thread and CUDA stream pair records into
+ * its own slot after every `cuMemcpyAsync`, re-recording the same event on later calls. Once all
+ * sub-ranges report completion, the caller calls `sync_all_events()` to block until each pair's
  * last H2D has drained.
  */
 class IoEventBarrier {
@@ -49,6 +50,27 @@ class IoEventBarrier {
    * @return The stored `CUcontext`.
    */
   [[nodiscard]] CUcontext cuda_context() const noexcept;
+
+  /**
+   * @brief Reserve the calling thread and stream pair's event before work is submitted.
+   *
+   * This performs every potentially allocating step needed by `record_prepared_event()`. It is
+   * idempotent for a given thread, stream, and barrier.
+   *
+   * @param stream The stream that will receive the asynchronous work.
+   */
+  void prepare_event(CUstream stream);
+
+  /**
+   * @brief Record an event previously reserved by `prepare_event()`.
+   *
+   * This method does not allocate. It must be called with the same thread and stream pair that
+   * prepared the event. A record failure marks aggregate completion unknown and removes the failed
+   * event from reuse.
+   *
+   * @param stream The stream whose preceding work the event must fence.
+   */
+  void record_prepared_event(CUstream stream);
 
   /**
    * @brief Record an event on `stream` in the calling thread's slot, creating the slot on first
@@ -86,10 +108,29 @@ class IoEventBarrier {
   void sync_all_events();
 
  private:
+  struct EventKey {
+    std::thread::id thread;
+    CUstream stream;
+
+    friend bool operator==(EventKey const& lhs, EventKey const& rhs) noexcept
+    {
+      return lhs.thread == rhs.thread && lhs.stream == rhs.stream;
+    }
+  };
+
+  struct EventKeyHash {
+    [[nodiscard]] std::size_t operator()(EventKey const& key) const noexcept
+    {
+      auto const thread_hash = std::hash<std::thread::id>{}(key.thread);
+      auto const stream_hash = std::hash<CUstream>{}(key.stream);
+      return thread_hash ^ (stream_hash + 0x9e3779b9U + (thread_hash << 6U) + (thread_hash >> 2U));
+    }
+  };
+
   CUcontext _cuda_context;
   std::atomic<bool> _completion_unknown{false};
   std::mutex _mutex;
-  std::unordered_map<std::thread::id, CudaEventPool::CudaEvent> _thread_events;
+  std::unordered_map<EventKey, CudaEventPool::CudaEvent, EventKeyHash> _events;
 };
 
 /**

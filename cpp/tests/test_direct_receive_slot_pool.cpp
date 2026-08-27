@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -146,6 +148,61 @@ TEST_F(DirectReceiveSlotPoolTest, MoveAssignmentReturnsPreviouslyOwnedSlot)
   auto recycled = pool->try_acquire();
   ASSERT_TRUE(recycled.has_value());
   EXPECT_EQ(recycled->get(), first_address);
+}
+
+TEST_F(DirectReceiveSlotPoolTest, BulkRecycleReturnsSamePoolSlotsAndIgnoresEmptyEntries)
+{
+  auto const slot_size = DirectReceiveSlotPool::minimum_slot_size();
+  auto pool            = DirectReceiveSlotPool::create_for_testing(slot_size, 3 * slot_size);
+  std::array<DirectReceiveSlotPool::Slot, 4> slots;
+  std::array<void*, 3> addresses{};
+  for (std::size_t i = 0; i < addresses.size(); ++i) {
+    auto acquired = pool->try_acquire();
+    ASSERT_TRUE(acquired.has_value());
+    addresses[i] = acquired->get();
+    slots[i]     = std::move(*acquired);
+  }
+
+  DirectReceiveSlotPool::recycle_completed(slots);
+  for (auto const& slot : slots) {
+    EXPECT_FALSE(static_cast<bool>(slot));
+  }
+  auto const recycled = pool->snapshot();
+  EXPECT_EQ(recycled.checked_out_slots, 0);
+  EXPECT_EQ(recycled.free_slots, 3);
+
+  std::array<void*, 3> reacquired_addresses{};
+  std::array<DirectReceiveSlotPool::Slot, 3> reacquired_slots;
+  for (std::size_t i = 0; i < reacquired_addresses.size(); ++i) {
+    auto reacquired = pool->try_acquire();
+    ASSERT_TRUE(reacquired.has_value());
+    reacquired_addresses[i] = reacquired->get();
+    reacquired_slots[i]     = std::move(*reacquired);
+  }
+  EXPECT_TRUE(std::is_permutation(
+    addresses.begin(), addresses.end(), reacquired_addresses.begin(), reacquired_addresses.end()));
+}
+
+TEST_F(DirectReceiveSlotPoolTest, BulkRecyclePreservesMixedPoolOwnership)
+{
+  auto const slot_size = DirectReceiveSlotPool::minimum_slot_size();
+  auto first_pool      = DirectReceiveSlotPool::create_for_testing(slot_size, slot_size);
+  auto second_pool     = DirectReceiveSlotPool::create_for_testing(slot_size, slot_size);
+  auto first           = first_pool->try_acquire();
+  auto second          = second_pool->try_acquire();
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  auto* first_address  = first->get();
+  auto* second_address = second->get();
+  std::array<DirectReceiveSlotPool::Slot, 2> slots{std::move(*first), std::move(*second)};
+
+  DirectReceiveSlotPool::recycle_completed(slots);
+  auto first_reacquired  = first_pool->try_acquire();
+  auto second_reacquired = second_pool->try_acquire();
+  ASSERT_TRUE(first_reacquired.has_value());
+  ASSERT_TRUE(second_reacquired.has_value());
+  EXPECT_EQ(first_reacquired->get(), first_address);
+  EXPECT_EQ(second_reacquired->get(), second_address);
 }
 
 TEST_F(DirectReceiveSlotPoolTest, CapIsPoolWideAcrossThreads)
