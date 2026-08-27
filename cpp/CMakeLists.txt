@@ -173,6 +173,7 @@ set(SOURCES
     "src/statistics/summary.cpp"
     "src/detail/bounce_buffer_cache.cpp"
     "src/detail/concurrent_request_limiter.cpp"
+    "src/detail/direct_receive_stats.cpp"
     "src/detail/env.cpp"
     "src/detail/event.cpp"
     "src/detail/io_event_barrier.cpp"

@@ -150,6 +150,8 @@ kvikio_add_test(NAME IO_EVENT_BARRIER_TEST SOURCES test_io_event_barrier.cpp)
 
 kvikio_add_test(NAME OBSERVATION_TEST SOURCES test_observation.cpp)
 
+kvikio_add_test(NAME REMOTE_DIRECT_RECEIVE_STATS_TEST SOURCES test_remote_direct_receive_stats.cpp)
+
 kvikio_add_test(NAME PARALLEL_OPERATION_TEST SOURCES test_parallel_operation.cpp)
 
 kvikio_add_test(NAME SUMMARY_TEST SOURCES test_summary.cpp)
