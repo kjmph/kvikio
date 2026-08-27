@@ -118,6 +118,23 @@ class RemoteEndpoint {
   virtual std::string str() const = 0;
 
   /**
+   * @brief Whether `setup_range_request()` configures an exact HTTP byte-range request.
+   *
+   * Caller-owned receive needs this stronger contract than the abstract range-request interface:
+   * body bytes are accepted only after validating an exact HTTP 206 response. Custom endpoints
+   * remain ineligible unless they opt in explicitly.
+   */
+  [[nodiscard]] virtual bool supports_exact_http_range() const noexcept { return false; }
+
+  /**
+   * @brief Whether the URL configured by `setopt()` uses origin TLS.
+   *
+   * This is separate from `str()`, which is only a human-readable description and need not be the
+   * URL passed to libcurl.
+   */
+  [[nodiscard]] virtual bool uses_origin_tls() const noexcept { return false; }
+
+  /**
    * @brief Get the size of the remote file.
    *
    * @return The file size
@@ -159,6 +176,8 @@ class HttpEndpoint : public RemoteEndpoint {
   ~HttpEndpoint() override = default;
   void setopt(CurlHandle& curl) override;
   std::string str() const override;
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override;
+  [[nodiscard]] bool uses_origin_tls() const noexcept override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
 
@@ -262,6 +281,8 @@ class S3Endpoint : public RemoteEndpoint {
   ~S3Endpoint() override;
   void setopt(CurlHandle& curl) override;
   std::string str() const override;
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override;
+  [[nodiscard]] bool uses_origin_tls() const noexcept override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
 
@@ -300,6 +321,8 @@ class S3PublicEndpoint : public RemoteEndpoint {
   ~S3PublicEndpoint() override = default;
   void setopt(CurlHandle& curl) override;
   std::string str() const override;
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override;
+  [[nodiscard]] bool uses_origin_tls() const noexcept override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
 
@@ -328,6 +351,8 @@ class S3EndpointWithPresignedUrl : public RemoteEndpoint {
   ~S3EndpointWithPresignedUrl() override = default;
   void setopt(CurlHandle& curl) override;
   std::string str() const override;
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override;
+  [[nodiscard]] bool uses_origin_tls() const noexcept override;
   std::size_t get_file_size() override;
   void setup_range_request(CurlHandle& curl, std::size_t file_offset, std::size_t size) override;
 

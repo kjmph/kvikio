@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <new>
@@ -21,6 +22,7 @@
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
 #include <kvikio/detail/bounce_buffer_cache.hpp>
+#include <kvikio/detail/direct_receive_stats.hpp>
 #include <kvikio/detail/multi_poll_reactor.hpp>
 #include <kvikio/detail/stream.hpp>
 #include <kvikio/error.hpp>
@@ -103,6 +105,45 @@ void fail_aggregate_transfer(RemoteMultiTransfer& transfer, std::exception_ptr f
   }
 }
 
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+// Receive slots are process-wide while admission queues are reactor-local. Keep new requests from
+// taking recycled slots ahead of an already-paused transfer, including when the two are owned by
+// different reactors. Existing waiters still race non-blockingly with one another; every range is
+// finite, so the winner eventually leaves the set and the remaining waiters make progress.
+std::atomic<std::size_t> direct_receive_waiter_count{};
+
+void mark_direct_receive_waiting(RemoteMultiTransfer::DirectReceiveState& state) noexcept
+{
+  if (state.waiting_for_slot) { return; }
+  state.waiting_for_slot = true;
+  direct_receive_waiter_count.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void clear_direct_receive_waiting(RemoteMultiTransfer::DirectReceiveState& state) noexcept
+{
+  if (!state.waiting_for_slot) { return; }
+  state.waiting_for_slot = false;
+  auto current           = direct_receive_waiter_count.load(std::memory_order_acquire);
+  while (true) {
+    if (current == 0) {
+      // Never wrap the global count on a defensive accounting path: that would permanently block
+      // all future admissions.
+      log_message_noexcept("direct-receive waiter accounting underflow: ", "count is already zero");
+      return;
+    }
+    if (direct_receive_waiter_count.compare_exchange_weak(
+          current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      return;
+    }
+  }
+}
+
+[[nodiscard]] bool direct_receive_has_waiters() noexcept
+{
+  return direct_receive_waiter_count.load(std::memory_order_acquire) != 0;
+}
+#endif
+
 }  // namespace
 
 #if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
@@ -166,6 +207,10 @@ CurlMultiAttachment& CurlMultiAttachment::operator=(CurlMultiAttachment&& other)
 
 RemoteMultiTransfer::~RemoteMultiTransfer()
 {
+  // Direct-receive callback state and its current slot are declared after the attachment. Detach
+  // explicitly so libcurl can never retain callback userdata while reverse member destruction
+  // tears that state down.
+  attachment.reset();
   using BounceBufferCache = BounceBufferCachePerThreadAndContext<CudaPinnedAllocator>;
   // A device transfer still holding its bounce buffer reaches here only on a failure path. The
   // success path moves the buffer into recycle_after, leaving buffer.get() == nullptr.
@@ -177,6 +222,13 @@ RemoteMultiTransfer::~RemoteMultiTransfer()
     log_failure_noexcept("RemoteMultiTransfer: buffer recycle failed: ", std::current_exception());
   }
 }
+
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+RemoteMultiTransfer::DirectReceiveState::~DirectReceiveState()
+{
+  clear_direct_receive_waiting(*this);
+}
+#endif
 
 RemoteMultiAggregateContext::RemoteMultiAggregateContext(std::size_t num_subranges)
   : _subranges_left{num_subranges}
@@ -367,18 +419,478 @@ void MultiPollReactor::submit(std::vector<std::unique_ptr<RemoteMultiTransfer>> 
   }
   if (fail_reason) {
     for (auto& transfer : transfers) {
-      if (transfer) { fail_aggregate_transfer(*transfer, fail_reason); }
+      if (transfer) {
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+        if (transfer->direct_receive != nullptr) { direct_receive_record_cancellation(); }
+#endif
+        fail_aggregate_transfer(*transfer, fail_reason);
+      }
     }
     return;
   }
   wakeup();
 }
 
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+
+bool MultiPollReactor::direct_receive_pool_is_permanently_exhausted() const
+{
+  auto const snapshot = DirectReceiveSlotPool::instance().snapshot();
+  return snapshot.max_slots != 0 && snapshot.quarantined_slots == snapshot.max_slots;
+}
+
+bool MultiPollReactor::try_install_direct_receive_slot(RemoteMultiTransfer& transfer,
+                                                       bool resume_transfer)
+{
+  auto& state = *transfer.direct_receive;
+  KVIKIO_EXPECT(
+    state.callbacks != nullptr, "direct receive has no callback state", std::logic_error);
+  KVIKIO_EXPECT(
+    !state.receive_slot, "direct receive already owns an installed slot", std::logic_error);
+  KVIKIO_EXPECT(state.callbacks->needs_buffer(),
+                "direct receive does not need a receive slot",
+                std::logic_error);
+
+  std::optional<DirectReceiveSlotPool::Slot> slot;
+  {
+    PushAndPopContext current{transfer.device_ctx};
+    slot = DirectReceiveSlotPool::instance().try_acquire();
+  }
+  if (!slot.has_value()) {
+    direct_receive_record_slot_exhaustion();
+    return false;
+  }
+
+  state.callbacks->install_buffer(slot->get(), slot->size());
+  state.receive_slot = std::move(slot.value());
+  direct_receive_record_slot_acquired();
+  if (resume_transfer) {
+    auto const result = curl_easy_pause(transfer.curl->handle(), CURLPAUSE_CONT);
+    KVIKIO_EXPECT(result == CURLE_OK,
+                  std::string{"curl_easy_pause(CURLPAUSE_CONT): "} + curl_easy_strerror(result),
+                  std::runtime_error);
+    clear_direct_receive_waiting(state);
+  }
+  return true;
+}
+
+void MultiPollReactor::submit_direct_receive_batch(DirectReceiveCudaWork& work)
+{
+  if (work.batch->submitted() || work.batch->completed() || work.batch->failed()) { return; }
+  DirectReceiveCudaSubmission submission;
+  try {
+    submission = work.batch->submit();
+  } catch (...) {
+    // A post-enqueue failure that the batch has fenced and made terminal is local to its owners.
+    // A pre-enqueue preparation failure leaves the batch collecting and all source slots safely
+    // owned by it. Owner cookies were published when each slot entered the batch, so the reactor
+    // can resolve those transfers locally and let batch destruction recycle the slots.
+    work.submission_failure = std::current_exception();
+    return;
+  }
+  if (!submission.asynchronous || !_cuda_host_wakeup_enabled) { return; }
+
+  auto const launch_result = cudaAPI::instance().LaunchHostFunc(
+    work.stream, &MultiPollReactor::cuda_completion_wakeup, this);
+  if (launch_result == CUDA_SUCCESS) { return; }
+
+  // Notification is only a latency hint. Classify this rare CUDA API failure by synchronously
+  // waiting for the already-recorded completion event, then retain the 1 ms event watchdog for all
+  // later batches on this reactor.
+  _cuda_host_wakeup_enabled = false;
+  try {
+    KVIKIO_LOG_WARN("cuLaunchHostFunc could not arm a direct-receive wakeup; using event polling");
+  } catch (...) {
+  }
+  try {
+    work.batch->wait();
+  } catch (...) {
+    if (!work.batch->failed()) { throw; }
+    work.submission_failure = std::current_exception();
+  }
+}
+
+void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer)
+{
+  auto& state = *transfer.direct_receive;
+  if (!state.callbacks->slot_ready()) { return; }
+  KVIKIO_EXPECT(state.receive_slot,
+                "direct receive published a slot without reactor ownership",
+                std::logic_error);
+
+  auto released = state.callbacks->take_released_slot();
+  auto const path =
+    state.strict_attempt ? DirectReceiveCudaPath::strict_rx : DirectReceiveCudaPath::copied_stream;
+  auto* const aggregate = transfer.aggregate.get();
+
+  while (true) {
+    auto work = std::find_if(_direct_receive_cuda_work.begin(),
+                             _direct_receive_cuda_work.end(),
+                             [&](DirectReceiveCudaWork const& candidate) {
+                               return candidate.submission_failure == nullptr &&
+                                      !candidate.batch->submitted() &&
+                                      !candidate.batch->completed() && !candidate.batch->failed() &&
+                                      candidate.cuda_context == transfer.device_ctx &&
+                                      candidate.path == path && candidate.aggregate == aggregate;
+                             });
+    if (work == _direct_receive_cuda_work.end()) {
+      PushAndPopContext current{transfer.device_ctx};
+      auto const stream = StreamCachePerThreadAndContext::get();
+      DirectReceiveCudaWork fresh;
+      fresh.cuda_context = transfer.device_ctx;
+      fresh.stream       = stream;
+      fresh.path         = path;
+      fresh.aggregate    = aggregate;
+      fresh.batch = std::make_unique<DirectReceiveCudaBatch>(transfer.device_ctx, stream, path);
+      _direct_receive_cuda_work.push_back(std::move(fresh));
+      work = std::prev(_direct_receive_cuda_work.end());
+    }
+
+    auto const owner_index = work->owner_count;
+    auto const added       = work->batch->try_add(state.receive_slot,
+                                            released,
+                                            convert_void2deviceptr(transfer.device_dst),
+                                            transfer.ctx.size,
+                                            transfer.aggregate->io_event_barrier,
+                                            owner_index);
+    if (added == DirectReceiveCudaAddResult::batch_full) {
+      submit_direct_receive_batch(*work);
+      continue;
+    }
+
+    KVIKIO_EXPECT(owner_index < work->owners.size(),
+                  "direct-receive CUDA accepted an unrepresentable owner cookie",
+                  std::logic_error);
+    // try_add moves slot ownership as its last non-throwing operation. Publish the owner and count
+    // immediately so CURLMSG_DONE cannot race a still-collecting final batch.
+    work->owners[owner_index] = &transfer;
+    ++work->owner_count;
+    ++state.cuda_slots_outstanding;
+    if (state.callbacks->body_complete()) {
+      clear_direct_receive_waiting(state);
+    } else {
+      mark_direct_receive_waiting(state);
+    }
+    return;
+  }
+}
+
+void MultiPollReactor::submit_collecting_direct_receive_batches()
+{
+  for (auto& work : _direct_receive_cuda_work) {
+    if (work.submission_failure == nullptr && !work.batch->submitted() &&
+        !work.batch->completed() && !work.batch->failed()) {
+      submit_direct_receive_batch(work);
+    }
+  }
+}
+
+void MultiPollReactor::resume_waiting_direct_receive_transfers()
+{
+  // Waiting transfers get first chance at every slot recycled since the preceding loop. This walk
+  // deliberately precedes pending admission below. The process-wide waiter count extends that
+  // priority across reactors without blocking an I/O thread on a condition variable.
+  for (auto& [_, transfer] : _in_flight) {
+    if (transfer->direct_receive == nullptr || transfer->direct_receive->network_done ||
+        !transfer->direct_receive->waiting_for_slot) {
+      continue;
+    }
+    if (!try_install_direct_receive_slot(*transfer, true)) {
+      if (direct_receive_pool_is_permanently_exhausted()) {
+        fail_direct_receive_after_cuda(
+          *transfer,
+          std::make_exception_ptr(std::runtime_error(
+            "direct-receive pinned-slot pool is permanently exhausted by quarantined "
+            "allocations")));
+        continue;
+      }
+      // No slot is available process-wide. Later waiters cannot succeed in this loop either.
+      break;
+    }
+    collect_direct_receive_slot(*transfer);
+  }
+}
+
+void MultiPollReactor::fail_direct_receive_after_cuda(RemoteMultiTransfer& transfer,
+                                                      std::exception_ptr failure) noexcept
+{
+  auto& state = *transfer.direct_receive;
+  if (state.cuda_failure == nullptr) { state.cuda_failure = std::move(failure); }
+  if (state.network_done) { return; }
+
+  // We are on the reactor thread and outside curl_multi_perform(), so detaching cancels further
+  // callbacks before returning an installed-but-unsubmitted slot to the pool.
+  transfer.attachment.reset();
+  transfer.slot.reset();
+  state.receive_slot.reset();
+  clear_direct_receive_waiting(state);
+  state.network_done   = true;
+  state.network_result = CURLE_ABORTED_BY_CALLBACK;
+}
+
+bool MultiPollReactor::reap_direct_receive_batches()
+{
+  bool completed_any{};
+  for (auto it = _direct_receive_cuda_work.begin(); it != _direct_receive_cuda_work.end();) {
+    bool const failed_before_submission = it->submission_failure != nullptr &&
+                                          !it->batch->submitted() && !it->batch->completed() &&
+                                          !it->batch->failed();
+    if (!failed_before_submission && !it->batch->submitted() && !it->batch->completed() &&
+        !it->batch->failed()) {
+      ++it;
+      continue;
+    }
+
+    std::exception_ptr batch_failure = it->submission_failure;
+    if (it->batch->submitted()) {
+      try {
+        if (!it->batch->poll()) {
+          ++it;
+          continue;
+        }
+      } catch (...) {
+        batch_failure = std::current_exception();
+      }
+    }
+    KVIKIO_EXPECT(!it->batch->failed() || batch_failure != nullptr,
+                  "direct-receive CUDA batch failed without its cause",
+                  std::logic_error);
+
+    auto finish_owner = [&](std::size_t cookie) {
+      KVIKIO_EXPECT(cookie < it->owner_count && it->owners[cookie] != nullptr,
+                    "direct-receive CUDA returned an unknown owner cookie",
+                    std::logic_error);
+      auto& transfer = *it->owners[cookie];
+      auto& state    = *transfer.direct_receive;
+      KVIKIO_EXPECT(state.cuda_slots_outstanding != 0,
+                    "direct-receive CUDA completion underflow",
+                    std::logic_error);
+      --state.cuda_slots_outstanding;
+      if (batch_failure != nullptr) { fail_direct_receive_after_cuda(transfer, batch_failure); }
+    };
+    if (failed_before_submission) {
+      for (std::size_t cookie = 0; cookie < it->owner_count; ++cookie) {
+        finish_owner(cookie);
+      }
+    } else {
+      auto const cookies = it->batch->finished_cookies();
+      KVIKIO_EXPECT(cookies.size() == it->owner_count,
+                    "direct-receive CUDA cookies do not match owners",
+                    std::logic_error);
+      for (auto const cookie : cookies) {
+        finish_owner(cookie);
+      }
+    }
+    completed_any = true;
+    it            = _direct_receive_cuda_work.erase(it);
+  }
+  if (completed_any) {
+    // Slots are process-wide. A batch on this reactor may unblock a paused transfer owned by a
+    // different reactor.
+    _pool->wakeup_all();
+  }
+  return completed_any;
+}
+
+void MultiPollReactor::record_direct_receive_failure(RemoteMultiTransfer& transfer,
+                                                     bool protocol_failure) noexcept
+{
+  auto& state = *transfer.direct_receive;
+  if (state.failure_recorded) { return; }
+  state.failure_recorded = true;
+  direct_receive_record_failed(protocol_failure ? DirectReceiveFailureReason::protocol_validation
+                                                : DirectReceiveFailureReason::other);
+}
+
+void MultiPollReactor::requeue_direct_receive(
+  std::unique_ptr<RemoteMultiTransfer> transfer,
+  bool strict_attempt,
+  std::chrono::steady_clock::time_point ready_at) noexcept
+{
+  try {
+    auto const file_offset                = transfer->direct_receive->file_offset;
+    auto const fallback_allowed           = transfer->direct_receive->fallback_allowed;
+    auto const strict_activation_recorded = transfer->direct_receive->strict_activation_recorded;
+    transfer->direct_receive->receive_slot.reset();
+
+    // A CURLMSG_DONE handle has no attached connection, so curl_easy_pause() is invalid here.
+    // Re-adding a completed easy handle starts a fresh transfer and resets its transfer-local pause
+    // state. Force a fresh connection as well because a failed direct attempt or partial response
+    // must never reuse its transport state.
+    transfer->curl->setopt(CURLOPT_FRESH_CONNECT, 1L);
+    transfer->curl->clear_error_message();
+    transfer->ctx.reset_for_retry();
+
+    auto next                        = std::make_unique<RemoteMultiTransfer::DirectReceiveState>();
+    next->file_offset                = file_offset;
+    next->fallback_allowed           = fallback_allowed;
+    next->strict_attempt             = strict_attempt;
+    next->strict_activation_recorded = strict_activation_recorded;
+    next->callbacks = std::make_unique<CurlDirectReceiveState>(file_offset, transfer->ctx.size);
+    next->callbacks->configure(*transfer->curl, strict_attempt);
+    transfer->direct_receive = std::move(next);
+    transfer->ready_at       = ready_at;
+    _pending.push_back(std::move(transfer));
+  } catch (...) {
+    auto const failure = std::current_exception();
+    if (transfer) {
+      record_direct_receive_failure(*transfer, false);
+      fail_aggregate_transfer(*transfer, failure);
+    }
+  }
+}
+
+void MultiPollReactor::finish_direct_receive_transfers(
+  std::optional<std::chrono::steady_clock::time_point>& earliest_ready_at)
+{
+  for (auto it = _in_flight.begin(); it != _in_flight.end();) {
+    auto* transfer_ptr = it->second.get();
+    if (transfer_ptr->direct_receive == nullptr || !transfer_ptr->direct_receive->network_done ||
+        transfer_ptr->direct_receive->cuda_slots_outstanding != 0) {
+      ++it;
+      continue;
+    }
+
+    auto transfer = std::move(it->second);
+    it            = _in_flight.erase(it);
+    auto& state   = *transfer->direct_receive;
+    try {
+      long direct_status = CURL_KTLS_DIRECT_RX_NONE;
+      transfer->curl->getinfo(CURLINFO_KTLS_DIRECT_RX_STATUS, &direct_status);
+      if (state.strict_attempt && direct_status == CURL_KTLS_DIRECT_RX_ACTIVE &&
+          !state.strict_activation_recorded) {
+        state.strict_activation_recorded = true;
+        direct_receive_record_strict_activated();
+      }
+
+      if (state.cuda_failure != nullptr) {
+        record_direct_receive_failure(*transfer, false);
+        fail_aggregate_transfer(*transfer, state.cuda_failure);
+        continue;
+      }
+
+      // Callback-state failures describe a local ownership or response-validation violation, not
+      // a transient transport error. Retrying one as an ordinary HTTP failure would hide the
+      // original cause and repeat a deterministic failure.
+      if (state.callbacks->callback_failed()) {
+        bool const protocol_failure = state.callbacks->callback_protocol_validation_failed();
+        record_direct_receive_failure(*transfer, protocol_failure);
+        fail_aggregate_transfer(*transfer,
+                                std::make_exception_ptr(std::runtime_error(
+                                  std::string{state.callbacks->callback_error()})));
+        continue;
+      }
+
+      if (state.network_result == CURLE_OK) {
+        auto validation_error = state.callbacks->validate(*transfer->curl);
+        if (!validation_error.has_value() && state.strict_attempt &&
+            direct_status != CURL_KTLS_DIRECT_RX_ACTIVE) {
+          validation_error = "strict direct receive completed without activating RX kTLS";
+        }
+        if (validation_error.has_value()) {
+          record_direct_receive_failure(*transfer, true);
+          fail_aggregate_transfer(
+            *transfer,
+            std::make_exception_ptr(std::runtime_error(std::move(validation_error.value()))));
+          continue;
+        }
+
+        if (state.strict_attempt) {
+          direct_receive_record_strict_completion(state.callbacks->raw_bytes(),
+                                                  state.callbacks->body_bytes());
+        } else {
+          direct_receive_record_copied_completion(state.callbacks->raw_bytes(),
+                                                  state.callbacks->body_bytes());
+        }
+        transfer->aggregate_terminal_reported = true;
+        transfer->aggregate->on_subrange_complete(transfer->ctx.size);
+        continue;
+      }
+
+      if (state.strict_attempt && state.fallback_allowed &&
+          direct_receive_can_fallback(
+            false, state.network_result, direct_status, state.callbacks->body_bytes())) {
+        direct_receive_record_fallback(DirectReceiveFallbackReason::capability_unavailable);
+        requeue_direct_receive(std::move(transfer), false, std::chrono::steady_clock::now());
+        continue;
+      }
+
+      long http_code{};
+      transfer->curl->getinfo(CURLINFO_RESPONSE_CODE, &http_code);
+      ++transfer->attempt;
+      auto const outcome = transfer->retry_policy->evaluate(state.network_result,
+                                                            http_code,
+                                                            transfer->attempt,
+                                                            transfer->curl->error_message(),
+                                                            "curl_multi transfer failed");
+      if (outcome.decision == RetryDecision::RETRY) {
+        try {
+          KVIKIO_LOG_WARN(outcome.message);
+        } catch (...) {
+        }
+        direct_receive_record_retry();
+        auto const ready_at = std::chrono::steady_clock::now() + outcome.delay_ms;
+        earliest_ready_at =
+          earliest_ready_at.has_value() ? std::min(earliest_ready_at.value(), ready_at) : ready_at;
+        requeue_direct_receive(std::move(transfer), state.strict_attempt, ready_at);
+        continue;
+      }
+
+      record_direct_receive_failure(*transfer, false);
+      fail_aggregate_transfer(*transfer,
+                              std::make_exception_ptr(std::runtime_error(outcome.message)));
+    } catch (...) {
+      if (transfer) {
+        record_direct_receive_failure(*transfer, false);
+        fail_aggregate_transfer(*transfer, std::current_exception());
+      }
+    }
+  }
+}
+
+void CUDA_CB MultiPollReactor::cuda_completion_wakeup(void* user_data) noexcept
+{
+  // Successfully published reactors are process-lifetime objects. Callback userdata must never
+  // point at a batch or transfer because its preceding event can become ready before this host
+  // function is scheduled by the CUDA driver.
+  auto* reactor = static_cast<MultiPollReactor*>(user_data);
+  if (reactor == nullptr) { return; }
+  if (!reactor->_cuda_completion_hint.exchange(true, std::memory_order_acq_rel)) {
+    auto const result = curl_multi_wakeup(reactor->_curl_multi);
+    if (result != CURLM_OK) { reactor->_cuda_wakeup_failed.store(true, std::memory_order_release); }
+  }
+}
+
+#endif
+
 void MultiPollReactor::io_thread_main()
 {
   using BounceBufferCache = BounceBufferCachePerThreadAndContext<CudaPinnedAllocator>;
   try {
     while (!_stop.load(std::memory_order_acquire) && !_pool->is_dead()) {
+      // Earliest backoff deadline among retried transfers. Direct-receive CUDA completions can
+      // requeue work before the pending walk, so this spans the complete loop iteration.
+      std::optional<std::chrono::steady_clock::time_point> earliest_ready_at;
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+      _cuda_completion_hint.store(false, std::memory_order_release);
+      if (_cuda_wakeup_failed.exchange(false, std::memory_order_acq_rel)) {
+        _cuda_host_wakeup_enabled = false;
+        try {
+          KVIKIO_LOG_WARN(
+            "curl_multi_wakeup failed from a CUDA completion callback; using event polling");
+        } catch (...) {
+        }
+      }
+      bool direct_cuda_completed = reap_direct_receive_batches();
+      finish_direct_receive_transfers(earliest_ready_at);
+      resume_waiting_direct_receive_transfers();
+      submit_collecting_direct_receive_batches();
+      direct_cuda_completed = reap_direct_receive_batches() || direct_cuda_completed;
+      finish_direct_receive_transfers(earliest_ready_at);
+#else
+      bool constexpr direct_cuda_completed = false;
+#endif
+
       // Stage (1): Splice newly submitted transfers out of the inbox (shared by the reactor thread
       // and submission thread) to minimize the lock duration.
       bool submission_failed_pool{};
@@ -408,8 +920,6 @@ void MultiPollReactor::io_thread_main()
       // Contexts whose bounce-buffer shard has already missed during this walk. It is assumed that
       // distinct contexts are few, so a flat vector with linear find suffices.
       std::vector<CUcontext> exhausted_ctxs;
-      // Earliest backoff deadline among the retried transfers.
-      std::optional<std::chrono::steady_clock::time_point> earliest_ready_at;
       // Whether anything is deferred because a limiter slot or bounce buffer is unavailable, rather
       // than because its backoff has not elapsed for retry.
       bool deferred_for_resource = false;
@@ -433,9 +943,12 @@ void MultiPollReactor::io_thread_main()
 
           // This ctx already missed the cache this walk, so defer without taking a limiter slot. At
           // worst this is pessimistic by one iteration if a recycle frees a buffer mid-walk.
-          if (transfer->is_device &&
-              std::find(exhausted_ctxs.begin(), exhausted_ctxs.end(), transfer->device_ctx) !=
-                exhausted_ctxs.end()) {
+          if (transfer->is_device
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+              && transfer->direct_receive == nullptr
+#endif
+              && std::find(exhausted_ctxs.begin(), exhausted_ctxs.end(), transfer->device_ctx) !=
+                   exhausted_ctxs.end()) {
             deferred_for_resource = true;
             deferred_transfers.push_back(std::move(transfer));
             continue;
@@ -455,22 +968,46 @@ void MultiPollReactor::io_thread_main()
           }
 
           if (transfer->is_device) {
-            // Gate 2 caps bounce-buffer use per (reactor thread, CUDA context) across all pipeline
-            // phases. A limiter slot freed at libcurl completion does not free the buffer, which
-            // stays in-flight until the H2D drains and the recycle callback fires.
-            std::optional<CudaPinnedBounceBufferPool::Buffer> bounce_buffer;
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+            if (transfer->direct_receive != nullptr) {
+              if (direct_receive_has_waiters()) {
+                deferred_for_resource = true;
+                deferred_transfers.push_back(std::move(transfer));
+                continue;
+              }
+              if (!try_install_direct_receive_slot(*transfer, false)) {
+                if (direct_receive_pool_is_permanently_exhausted()) {
+                  auto const failure = std::make_exception_ptr(std::runtime_error(
+                    "direct-receive pinned-slot pool is permanently exhausted by quarantined "
+                    "allocations"));
+                  record_direct_receive_failure(*transfer, false);
+                  fail_aggregate_transfer(*transfer, failure);
+                } else {
+                  deferred_for_resource = true;
+                  deferred_transfers.push_back(std::move(transfer));
+                }
+                continue;
+              }
+            } else
+#endif
             {
-              PushAndPopContext c(transfer->device_ctx);
-              bounce_buffer = BounceBufferCache::instance().try_get(transfer->device_ctx);
+              // Gate 2 caps bounce-buffer use per (reactor thread, CUDA context) across all
+              // pipeline phases. A limiter slot freed at libcurl completion does not free the
+              // buffer, which stays in-flight until the H2D drains and the recycle callback fires.
+              std::optional<CudaPinnedBounceBufferPool::Buffer> bounce_buffer;
+              {
+                PushAndPopContext c(transfer->device_ctx);
+                bounce_buffer = BounceBufferCache::instance().try_get(transfer->device_ctx);
+              }
+              if (!bounce_buffer.has_value()) {
+                deferred_for_resource = true;
+                exhausted_ctxs.push_back(transfer->device_ctx);
+                deferred_transfers.push_back(std::move(transfer));
+                continue;
+              }
+              transfer->buffer            = std::move(bounce_buffer.value());
+              transfer->ctx.pinned_buffer = transfer->buffer.get();
             }
-            if (!bounce_buffer.has_value()) {
-              deferred_for_resource = true;
-              exhausted_ctxs.push_back(transfer->device_ctx);
-              deferred_transfers.push_back(std::move(transfer));
-              continue;
-            }
-            transfer->buffer            = std::move(bounce_buffer.value());
-            transfer->ctx.pinned_buffer = transfer->buffer.get();
           }
 
           CURL* easy = transfer->curl->handle();
@@ -507,9 +1044,21 @@ void MultiPollReactor::io_thread_main()
           // Do not allocate while recovering from an allocation failure. Fail locally owned state
           // in place; the outer reactor catch declares pool death and fail_all_pending handles the
           // entries that remain in reactor containers.
-          if (transfer) { fail_aggregate_transfer(*transfer, failure); }
+          if (transfer) {
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+            if (transfer->direct_receive != nullptr) {
+              record_direct_receive_failure(*transfer, false);
+            }
+#endif
+            fail_aggregate_transfer(*transfer, failure);
+          }
           for (auto& deferred : deferred_transfers) {
-            if (deferred) { fail_aggregate_transfer(*deferred, failure); }
+            if (deferred) {
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+              if (deferred->direct_receive != nullptr) { direct_receive_record_cancellation(); }
+#endif
+              fail_aggregate_transfer(*deferred, failure);
+            }
           }
           std::rethrow_exception(failure);
         }
@@ -524,11 +1073,21 @@ void MultiPollReactor::io_thread_main()
                     std::string("curl_multi_perform: ") + curl_multi_strerror(perform_mc),
                     std::runtime_error);
 
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+      // Release callbacks run inside curl_multi_perform. Harvest every full slot before reading
+      // DONE messages; the final short slot is finalized in the DONE branch below.
+      for (auto& [_, transfer] : _in_flight) {
+        if (transfer->direct_receive != nullptr && !transfer->direct_receive->network_done) {
+          collect_direct_receive_slot(*transfer);
+        }
+      }
+#endif
+
       // Stage (3): Drain completions.
       int msgs_left = 0;
       // A completion frees a limiter slot, which may unblock a deferred transfer waiting on one.
       // Stage (4) uses this to shorten the poll timeout.
-      bool completed_any = false;
+      bool completed_any = direct_cuda_completed;
       while (auto* msg = curl_multi_info_read(_curl_multi, &msgs_left)) {
         if (msg->msg != CURLMSG_DONE) { continue; }
         completed_any = true;
@@ -539,6 +1098,22 @@ void MultiPollReactor::io_thread_main()
         KVIKIO_EXPECT(it != _in_flight.end(),
                       "MultiPollReactor: completion for unknown handle",
                       std::runtime_error);
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+        if (it->second->direct_receive != nullptr) {
+          auto& transfer = *it->second;
+          auto& state    = *transfer.direct_receive;
+          // Network capacity is independent of GPU drain latency. Detach and release it now, but
+          // retain the heap object in `_in_flight` so CUDA owner cookies remain valid.
+          transfer.attachment.reset();
+          transfer.slot.reset();
+          state.callbacks->finalize_current_slot();
+          collect_direct_receive_slot(transfer);
+          clear_direct_receive_waiting(state);
+          state.network_result = res;
+          state.network_done   = true;
+          continue;
+        }
+#endif
         auto transfer = std::move(it->second);
         _in_flight.erase(it);
 
@@ -628,6 +1203,12 @@ void MultiPollReactor::io_thread_main()
         if (transfer_err) { fail_aggregate_transfer(*transfer, transfer_err); }
       }
 
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+      submit_collecting_direct_receive_batches();
+      completed_any = reap_direct_receive_batches() || completed_any;
+      finish_direct_receive_transfers(earliest_ready_at);
+#endif
+
       // Stage (4): Wait for socket activity, a wakeup, a timeout, or elapsed backoff for retry.
       constexpr int idle_timeout_ms = 1000;
       constexpr int busy_timeout_ms = 10;
@@ -654,6 +1235,11 @@ void MultiPollReactor::io_thread_main()
         // Wait for a limiter slot or bounce buffer resource
         poll_timeout_ms = busy_timeout_ms;
       }
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+      // CUDA completion has no socket descriptor. Host callbacks normally wake this poll promptly,
+      // while this watchdog preserves progress when the callback or curl wakeup is lost/suppressed.
+      if (!_direct_receive_cuda_work.empty()) { poll_timeout_ms = std::min(poll_timeout_ms, 1); }
+#endif
       auto const poll_mc = curl_multi_poll(_curl_multi,
                                            nullptr,          // extra_fds
                                            0,                // extra_nfds
@@ -727,6 +1313,9 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
     while (!_inbox.empty()) {
       auto transfer = std::move(_inbox.front());
       _inbox.pop_front();
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+      if (transfer->direct_receive != nullptr) { direct_receive_record_cancellation(); }
+#endif
       fail_aggregate_transfer(*transfer, eptr);
     }
   }
@@ -735,11 +1324,38 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
   while (!_pending.empty()) {
     auto transfer = std::move(_pending.front());
     _pending.pop_front();
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+    if (transfer->direct_receive != nullptr) { direct_receive_record_cancellation(); }
+#endif
     fail_aggregate_transfer(*transfer, eptr);
   }
 
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  // CUDA batches carry raw pointers into `_in_flight`. Detach every active easy handle, then fence
+  // or fail-close every batch before any pointed-to transfer can be destroyed.
+  for (auto& [_, transfer] : _in_flight) {
+    if (transfer->direct_receive != nullptr) {
+      transfer->attachment.reset();
+      transfer->slot.reset();
+      transfer->direct_receive->receive_slot.reset();
+    }
+  }
+  for (auto& work : _direct_receive_cuda_work) {
+    if (!work.batch->submitted()) { continue; }
+    try {
+      work.batch->wait();
+    } catch (...) {
+      log_failure_noexcept("direct-receive CUDA cleanup failed: ", std::current_exception());
+    }
+  }
+  _direct_receive_cuda_work.clear();
+#endif
+
   // In-flight is touched only by the I/O thread, which is us, so no lock needed.
   for (auto& in_flight_entry : _in_flight) {
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+    if (in_flight_entry.second->direct_receive != nullptr) { direct_receive_record_cancellation(); }
+#endif
     fail_aggregate_transfer(*in_flight_entry.second, eptr);
   }
   _in_flight.clear();

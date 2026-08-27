@@ -3,12 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -24,9 +28,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <kvikio/defaults.hpp>
+#include <kvikio/detail/direct_receive_cuda.hpp>
+#include <kvikio/detail/direct_receive_slot_pool.hpp>
 #include <kvikio/detail/io_event_barrier.hpp>
 #include <kvikio/hdfs.hpp>
+#include <kvikio/remote_direct_receive.hpp>
 #include <kvikio/remote_handle.hpp>
+#include <kvikio/shim/cuda.hpp>
 #include <kvikio/shim/libcurl.hpp>
 
 #include "utils/env.hpp"
@@ -37,9 +45,16 @@ using ::testing::ThrowsMessage;
 
 namespace {
 
-class OneRequestHttpServer {
+class LocalHttpServer {
  public:
-  explicit OneRequestHttpServer(std::string body = {}) : _body{std::move(body)}
+  explicit LocalHttpServer(std::string body                   = {},
+                           bool exact_range                   = false,
+                           std::size_t transient_failures     = 0,
+                           std::size_t pause_after_body_bytes = 0)
+    : _body{std::move(body)},
+      _exact_range{exact_range},
+      _transient_failures{transient_failures},
+      _pause_after_body_bytes{pause_after_body_bytes}
   {
     _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (_listen_fd < 0) { throw std::runtime_error(std::strerror(errno)); }
@@ -75,8 +90,9 @@ class OneRequestHttpServer {
     _thread = std::thread{[this] { serve(); }};
   }
 
-  ~OneRequestHttpServer()
+  ~LocalHttpServer()
   {
+    resume_body();
     if (_listen_fd >= 0) {
       ::shutdown(_listen_fd, SHUT_RDWR);
       ::close(_listen_fd);
@@ -86,6 +102,30 @@ class OneRequestHttpServer {
   }
 
   [[nodiscard]] uint16_t port() const noexcept { return _port; }
+
+  [[nodiscard]] bool wait_until_accepted(std::chrono::milliseconds timeout)
+  {
+    std::unique_lock lock{_state_mutex};
+    return _state_cv.wait_for(lock, timeout, [this] { return _accepted; });
+  }
+
+  [[nodiscard]] bool wait_until_body_paused(std::chrono::milliseconds timeout)
+  {
+    std::unique_lock lock{_state_mutex};
+    return _state_cv.wait_for(lock, timeout, [this] { return _body_paused; });
+  }
+
+  void resume_body() noexcept
+  {
+    try {
+      {
+        std::lock_guard lock{_state_mutex};
+        _resume_body = true;
+      }
+      _state_cv.notify_all();
+    } catch (...) {
+    }
+  }
 
   [[nodiscard]] std::string const& request()
   {
@@ -107,21 +147,59 @@ class OneRequestHttpServer {
 
   void serve()
   {
-    auto const client = ::accept(_listen_fd, nullptr, nullptr);
-    if (client < 0) { return; }
+    for (std::size_t attempt = 0; attempt <= _transient_failures; ++attempt) {
+      auto const client = ::accept(_listen_fd, nullptr, nullptr);
+      if (client < 0) { return; }
+      {
+        std::lock_guard lock{_state_mutex};
+        _accepted = true;
+      }
+      _state_cv.notify_all();
 
-    char buffer[4096];
-    while (_request.find("\r\n\r\n") == std::string::npos) {
-      auto const received = ::recv(client, buffer, sizeof(buffer), 0);
-      if (received <= 0) { break; }
-      _request.append(buffer, static_cast<std::size_t>(received));
+      std::string request;
+      char buffer[4096];
+      while (request.find("\r\n\r\n") == std::string::npos) {
+        auto const received = ::recv(client, buffer, sizeof(buffer), 0);
+        if (received <= 0) { break; }
+        request.append(buffer, static_cast<std::size_t>(received));
+      }
+      _request += request;
+
+      auto response_header = std::string{};
+      if (attempt < _transient_failures) {
+        response_header =
+          "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: "
+          "close\r\n\r\n";
+      } else if (_exact_range) {
+        response_header = std::string{"HTTP/1.1 206 Partial Content\r\nContent-Length: "} +
+                          std::to_string(_body.size()) + "\r\nContent-Range: bytes 0-" +
+                          std::to_string(_body.size() - 1) + "/" + std::to_string(_body.size()) +
+                          "\r\nConnection: close\r\n\r\n";
+      } else {
+        response_header = std::string{"HTTP/1.1 200 OK\r\nContent-Length: "} +
+                          std::to_string(_body.size()) + "\r\nConnection: close\r\n\r\n";
+      }
+      if (!send_all(client, response_header.data(), response_header.size())) {
+        ::close(client);
+        return;
+      }
+      if (attempt >= _transient_failures) {
+        auto const prefix = std::min(_pause_after_body_bytes, _body.size());
+        if (!send_all(client, _body.data(), prefix)) {
+          ::close(client);
+          return;
+        }
+        if (prefix != 0 && prefix < _body.size()) {
+          std::unique_lock lock{_state_mutex};
+          _body_paused = true;
+          _state_cv.notify_all();
+          _state_cv.wait(lock, [this] { return _resume_body; });
+        }
+        std::ignore = send_all(client, _body.data() + prefix, _body.size() - prefix);
+      }
+      ::shutdown(client, SHUT_RDWR);
+      ::close(client);
     }
-
-    auto const response = std::string{"HTTP/1.1 200 OK\r\nContent-Length: "} +
-                          std::to_string(_body.size()) + "\r\nConnection: close\r\n\r\n" + _body;
-    std::ignore = send_all(client, response.data(), response.size());
-    ::shutdown(client, SHUT_RDWR);
-    ::close(client);
   }
 
   int _listen_fd = -1;
@@ -129,7 +207,26 @@ class OneRequestHttpServer {
   std::thread _thread;
   std::string _request;
   std::string _body;
+  bool _exact_range{};
+  std::size_t _transient_failures{};
+  std::size_t _pause_after_body_bytes{};
+  std::mutex _state_mutex;
+  std::condition_variable _state_cv;
+  bool _accepted{};
+  bool _body_paused{};
+  bool _resume_body{};
 };
+
+template <typename Predicate>
+[[nodiscard]] bool wait_until(Predicate&& predicate, std::chrono::milliseconds timeout)
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (!predicate()) {
+    if (std::chrono::steady_clock::now() >= deadline) { return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return true;
+}
 
 std::atomic<std::size_t> stream_synchronize_calls{};
 std::atomic<std::size_t> context_synchronize_calls{};
@@ -172,15 +269,119 @@ class ScopedCudaCompletionFailure {
   }
 };
 
+std::atomic<std::size_t> event_query_failures{};
+decltype(kvikio::cudaAPI::instance().EventQuery) saved_event_query{};
+
+CUresult CUDAAPI fail_one_event_query(CUevent event)
+{
+  if (event_query_failures.fetch_add(1, std::memory_order_relaxed) == 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  return saved_event_query(event);
+}
+
+class ScopedEventQueryFailure {
+ public:
+  ScopedEventQueryFailure()
+  {
+    auto& event_query = kvikio::cudaAPI::instance().EventQuery;
+    saved_event_query = event_query;
+    event_query_failures.store(0, std::memory_order_relaxed);
+    event_query = &fail_one_event_query;
+  }
+
+  ScopedEventQueryFailure(ScopedEventQueryFailure const&)            = delete;
+  ScopedEventQueryFailure& operator=(ScopedEventQueryFailure const&) = delete;
+
+  ~ScopedEventQueryFailure() { kvikio::cudaAPI::instance().EventQuery = saved_event_query; }
+};
+
+std::atomic<bool> hold_event_queries{};
+std::atomic<std::size_t> held_event_query_calls{};
+
+CUresult CUDAAPI hold_event_query(CUevent event)
+{
+  if (hold_event_queries.load(std::memory_order_acquire)) {
+    held_event_query_calls.fetch_add(1, std::memory_order_relaxed);
+    return CUDA_ERROR_NOT_READY;
+  }
+  return saved_event_query(event);
+}
+
+class ScopedEventQueryGate {
+ public:
+  ScopedEventQueryGate()
+  {
+    auto& event_query = kvikio::cudaAPI::instance().EventQuery;
+    saved_event_query = event_query;
+    held_event_query_calls.store(0, std::memory_order_relaxed);
+    hold_event_queries.store(true, std::memory_order_release);
+    event_query = &hold_event_query;
+  }
+
+  ScopedEventQueryGate(ScopedEventQueryGate const&)            = delete;
+  ScopedEventQueryGate& operator=(ScopedEventQueryGate const&) = delete;
+
+  void release() noexcept { hold_event_queries.store(false, std::memory_order_release); }
+
+  ~ScopedEventQueryGate()
+  {
+    release();
+    kvikio::cudaAPI::instance().EventQuery = saved_event_query;
+  }
+};
+
+std::atomic<std::size_t> event_record_calls{};
+decltype(kvikio::cudaAPI::instance().EventRecord) saved_event_record{};
+
+CUresult CUDAAPI fail_second_event_record(CUevent event, CUstream stream)
+{
+  auto const call = event_record_calls.fetch_add(1, std::memory_order_relaxed);
+  if (call == 1) { return CUDA_ERROR_INVALID_VALUE; }
+  return saved_event_record(event, stream);
+}
+
+class ScopedEventRecordFailure {
+ public:
+  ScopedEventRecordFailure()
+  {
+    auto& event_record = kvikio::cudaAPI::instance().EventRecord;
+    saved_event_record = event_record;
+    event_record_calls.store(0, std::memory_order_relaxed);
+    event_record = &fail_second_event_record;
+  }
+
+  ScopedEventRecordFailure(ScopedEventRecordFailure const&)            = delete;
+  ScopedEventRecordFailure& operator=(ScopedEventRecordFailure const&) = delete;
+
+  ~ScopedEventRecordFailure() { kvikio::cudaAPI::instance().EventRecord = saved_event_record; }
+};
+
 }  // namespace
 
 class CountingEndpoint : public kvikio::RemoteEndpoint {
  public:
-  CountingEndpoint() : RemoteEndpoint{kvikio::RemoteEndpointType::HTTP} {}
+  explicit CountingEndpoint(
+    kvikio::RemoteEndpointType endpoint_type = kvikio::RemoteEndpointType::HTTP,
+    std::string url                          = "http://example.com/test")
+    : RemoteEndpoint{endpoint_type}, _url{std::move(url)}
+  {
+  }
 
   void setopt(kvikio::CurlHandle&) override { ++setopt_calls; }
 
-  std::string str() const override { return "http://example.com/test"; }
+  std::string str() const override { return _url; }
+
+  [[nodiscard]] bool supports_exact_http_range() const noexcept override
+  {
+    return remote_endpoint_type() != kvikio::RemoteEndpointType::WEBHDFS &&
+           remote_endpoint_type() != kvikio::RemoteEndpointType::AUTO;
+  }
+
+  [[nodiscard]] bool uses_origin_tls() const noexcept override
+  {
+    return _url.starts_with("https://");
+  }
 
   std::size_t get_file_size() override { return file_size; }
 
@@ -192,6 +393,9 @@ class CountingEndpoint : public kvikio::RemoteEndpoint {
   std::size_t file_size{100};
   int setopt_calls{};
   int range_request_calls{};
+
+ private:
+  std::string _url;
 };
 
 class RestoreRemoteIoBackend {
@@ -204,8 +408,46 @@ class RestoreRemoteIoBackend {
   kvikio::RemoteIOBackend _backend;
 };
 
+class RestoreRemoteDirectReceiveMode {
+ public:
+  RestoreRemoteDirectReceiveMode() : _mode{kvikio::defaults::remote_direct_receive_mode()} {}
+  ~RestoreRemoteDirectReceiveMode() { kvikio::defaults::set_remote_direct_receive_mode(_mode); }
+
+ private:
+  kvikio::RemoteDirectReceiveMode _mode;
+};
+
+class RestoreHttpRetryPolicy {
+ public:
+  RestoreHttpRetryPolicy()
+    : _max_attempts{kvikio::defaults::http_max_attempts()},
+      _status_codes{kvikio::defaults::http_status_codes()}
+  {
+  }
+
+  ~RestoreHttpRetryPolicy()
+  {
+    kvikio::defaults::set_http_max_attempts(_max_attempts);
+    kvikio::defaults::set_http_status_codes(std::move(_status_codes));
+  }
+
+ private:
+  std::size_t _max_attempts;
+  std::vector<int> _status_codes;
+};
+
 class RemoteHandleTest : public testing::Test {
  protected:
+  static void SetUpTestSuite()
+  {
+    static std::once_flag configured;
+    std::call_once(configured, [] {
+      auto const slot_size = kvikio::detail::DirectReceiveSlotPool::minimum_slot_size();
+      kvikio::defaults::set_remote_direct_receive_slot_size(slot_size);
+      kvikio::defaults::set_remote_direct_receive_max_pinned_bytes(slot_size);
+    });
+  }
+
   void SetUp() override
   {
     _sample_urls = {
@@ -311,7 +553,7 @@ TEST_F(RemoteHandleTest, s3_endpoint_constructor)
 
 TEST_F(RemoteHandleTest, s3_endpoint_forwards_explicit_session_token_for_non_sts_key)
 {
-  OneRequestHttpServer server;
+  LocalHttpServer server;
   auto const url = "http://127.0.0.1:" + std::to_string(server.port()) + "/object";
   kvikio::S3Endpoint endpoint(
     url, "us-east-1", "CUSTOMACCESSKEY", "secret-access-key", "explicit-session-token");
@@ -344,6 +586,17 @@ TEST_F(RemoteHandleTest, test_http_url)
   }
 }
 
+TEST_F(RemoteHandleTest, http_endpoint_reports_direct_receive_transport_capabilities)
+{
+  kvikio::HttpEndpoint cleartext{"http://example.com/object"};
+  EXPECT_TRUE(cleartext.supports_exact_http_range());
+  EXPECT_FALSE(cleartext.uses_origin_tls());
+
+  kvikio::HttpEndpoint tls{"HTTPS://example.com/object"};
+  EXPECT_TRUE(tls.supports_exact_http_range());
+  EXPECT_TRUE(tls.uses_origin_tls());
+}
+
 TEST_F(RemoteHandleTest, read_zero_size_returns_without_range_request)
 {
   auto endpoint      = std::make_unique<CountingEndpoint>();
@@ -374,7 +627,7 @@ TEST_F(RemoteHandleTest, read_overflowing_range_throws_without_range_request)
 TEST_F(RemoteHandleTest, device_read_failure_fences_context_before_rethrow)
 {
   KVIKIO_CHECK_CUDA(cudaSetDevice(0));
-  OneRequestHttpServer server{"x"};
+  LocalHttpServer server{"x"};
   auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
     "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
   kvikio::RemoteHandle remote_handle(std::move(endpoint), 1);
@@ -406,6 +659,321 @@ TEST_F(RemoteHandleTest, completion_future_failure_precedes_device_transfer_subm
   // handoff. No asynchronous work can retain the caller-owned destination.
   EXPECT_EQ(endpoint_ptr->setopt_calls, 1);
   EXPECT_EQ(endpoint_ptr->range_request_calls, 1);
+}
+
+TEST_F(RemoteHandleTest, multi_poll_copied_stream_rotates_one_bounded_direct_receive_slot)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+
+  auto const slot_size = kvikio::detail::DirectReceiveSlotPool::minimum_slot_size();
+  kvikio::reset_remote_direct_receive_stats();
+
+  std::string body(3 * slot_size + 137, '\0');
+  for (std::size_t i = 0; i < body.size(); ++i) {
+    body[i] = static_cast<char>((i * 131U + 17U) & 0xffU);
+  }
+  LocalHttpServer server{body, true};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), body.size());
+  kvikio::test::DevBuffer<char> output(body.size());
+
+  auto completion = remote_handle.pread(output.ptr, body.size(), 0, body.size());
+  EXPECT_EQ(completion.get(), body.size());
+  std::string actual(body.size(), '\0');
+  KVIKIO_CHECK_CUDA(cudaMemcpy(actual.data(), output.ptr, actual.size(), cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, body);
+
+  auto const stats = kvikio::remote_direct_receive_stats();
+  EXPECT_EQ(stats.transfers_requested, 1);
+  EXPECT_EQ(stats.strict_rx_transfers_activated, 0);
+  EXPECT_EQ(stats.strict_rx_transfers_completed, 0);
+  EXPECT_EQ(stats.transfers_fallback, 1);
+  EXPECT_EQ(stats.fallback_ineligible_request, 1);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
+  EXPECT_EQ(stats.copied_stream_body_bytes, body.size());
+  EXPECT_EQ(stats.copied_stream_h2d_bytes, body.size());
+  EXPECT_GE(stats.copied_stream_raw_received_bytes, body.size());
+  EXPECT_GE(stats.copied_stream_h2d_batches, 3);
+  EXPECT_GE(stats.pinned_slots_acquired, 3);
+
+  auto const pool = kvikio::detail::DirectReceiveSlotPool::instance().snapshot();
+  EXPECT_EQ(pool.checked_out_slots, 0);
+  EXPECT_EQ(pool.free_slots, 1);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_direct_receive_prioritizes_a_paused_read)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+
+  auto const slot_size = kvikio::detail::DirectReceiveSlotPool::minimum_slot_size();
+  std::string first_body(2 * slot_size + 137, 'a');
+  std::string second_body(2 * slot_size + 251, 'b');
+  LocalHttpServer first_server{first_body, true, 0, slot_size};
+  LocalHttpServer second_server{second_body, true};
+  auto first_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(first_server.port()) + "/first");
+  auto second_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(second_server.port()) + "/second");
+  kvikio::RemoteHandle first_handle(std::move(first_endpoint), first_body.size());
+  kvikio::RemoteHandle second_handle(std::move(second_endpoint), second_body.size());
+  kvikio::test::DevBuffer<char> first_output(first_body.size());
+  kvikio::test::DevBuffer<char> second_output(second_body.size());
+
+  kvikio::reset_remote_direct_receive_stats();
+  ScopedEventQueryGate cuda_gate;
+  auto first = first_handle.pread(first_output.ptr, first_body.size(), 0, first_body.size());
+  EXPECT_TRUE(first_server.wait_until_body_paused(std::chrono::seconds{5}));
+  EXPECT_TRUE(wait_until([] { return held_event_query_calls.load(std::memory_order_relaxed) != 0; },
+                         std::chrono::seconds{5}));
+
+  // The first read is paused without a receive slot while its first H2D remains gated. Queue a new
+  // read, then let that slot recycle. A pending-first reactor would admit the second connection;
+  // waiter priority must instead reinstall the slot on the already-paused first transfer.
+  auto second = second_handle.pread(second_output.ptr, second_body.size(), 0, second_body.size());
+  cuda_gate.release();
+  EXPECT_TRUE(
+    wait_until([] { return kvikio::remote_direct_receive_stats().pinned_slots_acquired >= 2; },
+               std::chrono::seconds{5}));
+  EXPECT_FALSE(second_server.wait_until_accepted(std::chrono::milliseconds{500}));
+
+  first_server.resume_body();
+  EXPECT_EQ(first.get(), first_body.size());
+  EXPECT_EQ(second.get(), second_body.size());
+
+  std::string first_actual(first_body.size(), '\0');
+  std::string second_actual(second_body.size(), '\0');
+  KVIKIO_CHECK_CUDA(
+    cudaMemcpy(first_actual.data(), first_output.ptr, first_actual.size(), cudaMemcpyDeviceToHost));
+  KVIKIO_CHECK_CUDA(cudaMemcpy(
+    second_actual.data(), second_output.ptr, second_actual.size(), cudaMemcpyDeviceToHost));
+  EXPECT_EQ(first_actual, first_body);
+  EXPECT_EQ(second_actual, second_body);
+
+  auto const stats = kvikio::remote_direct_receive_stats();
+  EXPECT_EQ(stats.transfers_requested, 2);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 2);
+  EXPECT_GE(stats.pinned_slots_acquired, 6);
+  EXPECT_GT(stats.pinned_slot_exhaustions, 0);
+  EXPECT_EQ(kvikio::detail::DirectReceiveSlotPool::instance().snapshot().checked_out_slots, 0);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_direct_receive_requeues_a_retryable_http_failure)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  RestoreHttpRetryPolicy const restore_retry;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::defaults::set_http_max_attempts(2);
+  kvikio::defaults::set_http_status_codes({503});
+  kvikio::reset_remote_direct_receive_stats();
+
+  std::string body(257, 'r');
+  LocalHttpServer server{body, true, 1};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), body.size());
+  kvikio::test::DevBuffer<char> output(body.size());
+
+  auto completion = remote_handle.pread(output.ptr, body.size(), 0, body.size());
+  EXPECT_EQ(completion.get(), body.size());
+  std::string actual(body.size(), '\0');
+  KVIKIO_CHECK_CUDA(cudaMemcpy(actual.data(), output.ptr, actual.size(), cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, body);
+
+  auto const stats = kvikio::remote_direct_receive_stats();
+  EXPECT_EQ(stats.transfers_requested, 1);
+  EXPECT_EQ(stats.retries, 1);
+  EXPECT_EQ(stats.copied_stream_transfers_completed, 1);
+  EXPECT_EQ(stats.transfers_failed, 0);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_cuda_failure_is_not_published_as_network_success)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::reset_remote_direct_receive_stats();
+
+  std::string body(257, 'x');
+  LocalHttpServer failed_server{body, true};
+  auto failed_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(failed_server.port()) + "/object");
+  kvikio::RemoteHandle failed_handle(std::move(failed_endpoint), body.size());
+  kvikio::test::DevBuffer<char> failed_output(body.size());
+
+  {
+    ScopedEventQueryFailure const failure;
+    auto completion = failed_handle.pread(failed_output.ptr, body.size(), 0, body.size());
+    EXPECT_THROW(std::ignore = completion.get(), kvikio::CUfileException);
+    EXPECT_GE(event_query_failures.load(std::memory_order_relaxed), 1);
+  }
+
+  auto const failed_stats = kvikio::remote_direct_receive_stats();
+  EXPECT_EQ(failed_stats.transfers_requested, 1);
+  EXPECT_EQ(failed_stats.copied_stream_transfers_completed, 0);
+  EXPECT_EQ(failed_stats.transfers_failed, 1);
+  EXPECT_EQ(kvikio::detail::DirectReceiveSlotPool::instance().snapshot().checked_out_slots, 0);
+
+  // A safely fenced per-transfer CUDA error must not poison the process-lifetime reactor pool.
+  LocalHttpServer recovery_server{body, true};
+  auto recovery_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(recovery_server.port()) + "/object");
+  kvikio::RemoteHandle recovery_handle(std::move(recovery_endpoint), body.size());
+  kvikio::test::DevBuffer<char> recovery_output(body.size());
+  auto recovery = recovery_handle.pread(recovery_output.ptr, body.size(), 0, body.size());
+  EXPECT_EQ(recovery.get(), body.size());
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_post_enqueue_cuda_failure_remains_transfer_local)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::reset_remote_direct_receive_stats();
+
+  std::string body(257, 'e');
+  LocalHttpServer failed_server{body, true};
+  auto failed_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(failed_server.port()) + "/object");
+  kvikio::RemoteHandle failed_handle(std::move(failed_endpoint), body.size());
+  kvikio::test::DevBuffer<char> failed_output(body.size());
+
+  {
+    ScopedEventRecordFailure const failure;
+    auto completion = failed_handle.pread(failed_output.ptr, body.size(), 0, body.size());
+    EXPECT_THROW(std::ignore = completion.get(), kvikio::CUfileException);
+    EXPECT_GE(event_record_calls.load(std::memory_order_relaxed), 2);
+  }
+  EXPECT_EQ(kvikio::remote_direct_receive_stats().transfers_failed, 1);
+  EXPECT_EQ(kvikio::detail::DirectReceiveSlotPool::instance().snapshot().checked_out_slots, 0);
+
+  LocalHttpServer recovery_server{body, true};
+  auto recovery_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(recovery_server.port()) + "/object");
+  kvikio::RemoteHandle recovery_handle(std::move(recovery_endpoint), body.size());
+  kvikio::test::DevBuffer<char> recovery_output(body.size());
+  auto recovery = recovery_handle.pread(recovery_output.ptr, body.size(), 0, body.size());
+  EXPECT_EQ(recovery.get(), body.size());
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, multi_poll_pre_enqueue_cuda_failure_remains_transfer_local)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::PREFER);
+  kvikio::reset_remote_direct_receive_stats();
+
+  std::string body(257, 'p');
+  LocalHttpServer failed_server{body, true};
+  auto failed_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(failed_server.port()) + "/object");
+  kvikio::RemoteHandle failed_handle(std::move(failed_endpoint), body.size());
+  kvikio::test::DevBuffer<char> failed_output(body.size());
+
+  kvikio::detail::DirectReceiveCudaBatch::inject_pre_submit_allocation_failure_for_testing();
+  auto completion = failed_handle.pread(failed_output.ptr, body.size(), 0, body.size());
+  EXPECT_THROW(std::ignore = completion.get(), std::bad_alloc);
+  EXPECT_EQ(kvikio::remote_direct_receive_stats().transfers_failed, 1);
+  EXPECT_EQ(kvikio::detail::DirectReceiveSlotPool::instance().snapshot().checked_out_slots, 0);
+
+  // The preparation error preceded every CUDA enqueue and must not poison the singleton reactor
+  // pool or its bounded receive-slot pool.
+  LocalHttpServer recovery_server{body, true};
+  auto recovery_endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(recovery_server.port()) + "/object");
+  kvikio::RemoteHandle recovery_handle(std::move(recovery_endpoint), body.size());
+  kvikio::test::DevBuffer<char> recovery_output(body.size());
+  auto recovery = recovery_handle.pread(recovery_output.ptr, body.size(), 0, body.size());
+  EXPECT_EQ(recovery.get(), body.size());
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, direct_receive_require_rejects_cleartext_before_publication)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::REQUIRE);
+
+  auto endpoint      = std::make_unique<CountingEndpoint>();
+  auto* endpoint_ptr = endpoint.get();
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), endpoint_ptr->file_size);
+  kvikio::test::DevBuffer<char> output(1);
+
+  EXPECT_THAT([&] { std::ignore = remote_handle.pread(output.ptr, 1, 0, 1); },
+              ThrowsMessage<std::runtime_error>(HasSubstr("REQUIRE needs an HTTPS endpoint")));
+  EXPECT_EQ(endpoint_ptr->setopt_calls, 0);
+  EXPECT_EQ(endpoint_ptr->range_request_calls, 0);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
+}
+
+TEST_F(RemoteHandleTest, direct_receive_require_rejects_webhdfs_before_publication)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  KVIKIO_CHECK_CUDA(cudaSetDevice(0));
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(kvikio::RemoteDirectReceiveMode::REQUIRE);
+
+  auto endpoint      = std::make_unique<CountingEndpoint>(kvikio::RemoteEndpointType::WEBHDFS,
+                                                     "https://example.com/webhdfs/v1/test");
+  auto* endpoint_ptr = endpoint.get();
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), endpoint_ptr->file_size);
+  kvikio::test::DevBuffer<char> output(1);
+
+  EXPECT_THAT(
+    [&] { std::ignore = remote_handle.pread(output.ptr, 1, 0, 1); },
+    ThrowsMessage<std::runtime_error>(HasSubstr("needs an exact-range HTTP or S3 endpoint")));
+  EXPECT_EQ(endpoint_ptr->setopt_calls, 0);
+  EXPECT_EQ(endpoint_ptr->range_request_calls, 0);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
 }
 
 TEST_F(RemoteHandleTest, test_s3_url)

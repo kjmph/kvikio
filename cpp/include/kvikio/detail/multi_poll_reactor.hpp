@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -21,6 +22,9 @@
 
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/detail/concurrent_request_limiter.hpp>
+#include <kvikio/detail/direct_receive.hpp>
+#include <kvikio/detail/direct_receive_cuda.hpp>
+#include <kvikio/detail/direct_receive_slot_pool.hpp>
 #include <kvikio/detail/http_retry.hpp>
 #include <kvikio/detail/io_event_barrier.hpp>
 #include <kvikio/detail/observation_recorder.hpp>
@@ -193,6 +197,34 @@ struct RemoteMultiTransfer {
   void* device_dst{nullptr};
   CudaPinnedBounceBufferPool::Buffer buffer{nullptr, nullptr, 0};
 
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  /**
+   * @brief Reactor-owned state for one caller-owned GPU receive transfer.
+   *
+   * Network completion and CUDA completion are deliberately separate. `network_done` releases the
+   * easy-handle attachment and request-limiter slot, while `cuda_slots_outstanding` keeps this
+   * transfer alive until every source slot has reached a terminal CUDA batch.
+   */
+  struct DirectReceiveState {
+    ~DirectReceiveState();
+
+    std::size_t file_offset{};
+    bool fallback_allowed{};
+    bool strict_attempt{true};
+    bool strict_activation_recorded{};
+    bool waiting_for_slot{};
+    bool network_done{};
+    bool failure_recorded{};
+    CURLcode network_result{CURLE_OK};
+    std::size_t cuda_slots_outstanding{};
+    std::exception_ptr cuda_failure;
+    std::unique_ptr<CurlDirectReceiveState> callbacks;
+    DirectReceiveSlotPool::Slot receive_slot;
+  };
+
+  std::unique_ptr<DirectReceiveState> direct_receive;
+#endif
+
   // Guards the aggregate promise against duplicate terminal callbacks while transfer ownership
   // moves through exceptional reactor paths.
   bool aggregate_terminal_reported{false};
@@ -341,6 +373,37 @@ class MultiPollReactor {
   void requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> transfer,
                          std::chrono::steady_clock::time_point ready_at) noexcept;
 
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  struct DirectReceiveCudaWork {
+    CUcontext cuda_context{};
+    CUstream stream{};
+    DirectReceiveCudaPath path{DirectReceiveCudaPath::strict_rx};
+    RemoteMultiAggregateContext* aggregate{};
+    std::unique_ptr<DirectReceiveCudaBatch> batch;
+    std::exception_ptr submission_failure;
+    std::array<RemoteMultiTransfer*, direct_receive_max_slots_per_cuda_batch> owners{};
+    std::size_t owner_count{};
+  };
+
+  [[nodiscard]] bool try_install_direct_receive_slot(RemoteMultiTransfer& transfer,
+                                                     bool resume_transfer);
+  void collect_direct_receive_slot(RemoteMultiTransfer& transfer);
+  void resume_waiting_direct_receive_transfers();
+  void submit_direct_receive_batch(DirectReceiveCudaWork& work);
+  void submit_collecting_direct_receive_batches();
+  [[nodiscard]] bool reap_direct_receive_batches();
+  void fail_direct_receive_after_cuda(RemoteMultiTransfer& transfer,
+                                      std::exception_ptr failure) noexcept;
+  void finish_direct_receive_transfers(
+    std::optional<std::chrono::steady_clock::time_point>& earliest_ready_at);
+  void requeue_direct_receive(std::unique_ptr<RemoteMultiTransfer> transfer,
+                              bool strict_attempt,
+                              std::chrono::steady_clock::time_point ready_at) noexcept;
+  void record_direct_receive_failure(RemoteMultiTransfer& transfer, bool protocol_failure) noexcept;
+  [[nodiscard]] bool direct_receive_pool_is_permanently_exhausted() const;
+  static void CUDA_CB cuda_completion_wakeup(void* user_data) noexcept;
+#endif
+
   MultiReactorPool* _pool;
   ConcurrentRequestLimiter _request_limiter;
   CURLM* _curl_multi{nullptr};
@@ -349,7 +412,15 @@ class MultiPollReactor {
   std::mutex _submit_mutex;
   std::deque<std::unique_ptr<RemoteMultiTransfer>> _inbox;
   std::deque<std::unique_ptr<RemoteMultiTransfer>> _pending;
+  // Direct-receive entries remain here after their easy handle is detached while released receive
+  // slots drain through CUDA. Their stable heap addresses are the CUDA batch's owner cookies.
   std::unordered_map<CURL*, std::unique_ptr<RemoteMultiTransfer>> _in_flight;
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  std::deque<DirectReceiveCudaWork> _direct_receive_cuda_work;
+  std::atomic<bool> _cuda_completion_hint{false};
+  std::atomic<bool> _cuda_wakeup_failed{false};
+  bool _cuda_host_wakeup_enabled{true};
+#endif
 };
 
 /**

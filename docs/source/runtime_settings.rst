@@ -103,6 +103,19 @@ The global budget is divided into a private share per reactor, so each reactor e
 
 The even split assumes sub-ranges are spread across reactors, which holds under ``PER_CHUNK``. Under ``PER_PREAD`` all sub-ranges of one large :py:func:`kvikio.RemoteFile.pread` land on a single reactor, so that read is effectively limited to one reactor's share while the others stay idle.
 
+Remote Direct Receive ``KVIKIO_REMOTE_DIRECT_RECEIVE``
+------------------------------------------------------
+
+Controls the experimental caller-owned receive path for GPU reads. The accepted values (case-insensitive) are:
+
+  * ``OFF`` (default): Use the ordinary remote receive path.
+  * ``PREFER``: Use bounded caller-owned pinned slots for eligible reads. HTTPS starts with strict RX-kTLS and may fall back to the same streaming slot pipeline through libcurl's copied receive path only when the patched transport reports that strict activation is unavailable before accepting body bytes. Cleartext HTTP uses the explicitly accounted copied path directly. Ineligible requests retain the ordinary path.
+  * ``REQUIRE``: Fail unless strict RX-kTLS can be requested and activates for every internal transfer. Unsupported builds and requests are rejected instead of silently benchmarking a copied path.
+
+Activation currently requires a device destination, the ``MULTI_POLL`` backend, an exact-range HTTP or S3 endpoint, and a libcurl build with KvikIO's caller-owned strict-receive API. WebHDFS, host destinations, and ``EASY_THREADPOOL`` remain on the ordinary path under ``PREFER`` and are rejected under ``REQUIRE``. Custom ``RemoteEndpoint`` implementations must explicitly report exact-range and origin-TLS capabilities. The streaming path accepts only an exact HTTP/1.1 ``206`` response with identity content encoding, matching ``Content-Length`` and ``Content-Range`` headers, and no transfer encoding.
+
+C++ callers may query or change the policy through ``defaults::remote_direct_receive_mode()`` and ``defaults::set_remote_direct_receive_mode()``. Configure it before starting concurrent remote I/O. Use ``remote_direct_receive_stats()`` to distinguish strict activation and completion from copied or ineligible fallback.
+
 Direct-Receive Slot Size ``KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE``
 -------------------------------------------------------------------
 
