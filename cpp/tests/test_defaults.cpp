@@ -1,20 +1,79 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <array>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <kvikio/compat_mode.hpp>
 #include <kvikio/defaults.hpp>
+#include <kvikio/remote_direct_receive.hpp>
 
 #include "utils/env.hpp"
 
 using ::testing::HasSubstr;
 using ::testing::ThrowsMessage;
+
+namespace {
+
+constexpr std::string_view direct_receive_test_env = "KVIKIO_TEST_REMOTE_DIRECT_RECEIVE";
+
+class RestoreDirectReceiveMode {
+ public:
+  RestoreDirectReceiveMode() : _mode{kvikio::defaults::remote_direct_receive_mode()} {}
+  ~RestoreDirectReceiveMode() { kvikio::defaults::set_remote_direct_receive_mode(_mode); }
+
+ private:
+  kvikio::RemoteDirectReceiveMode _mode;
+};
+
+}  // namespace
+
+TEST(DefaultsTest, parse_remote_direct_receive_mode)
+{
+  using Mode = kvikio::RemoteDirectReceiveMode;
+  for (auto const& [value, expected] : std::array{std::pair{"off", Mode::OFF},
+                                                  std::pair{"PREFER", Mode::PREFER},
+                                                  std::pair{"  Require  ", Mode::REQUIRE}}) {
+    kvikio::test::EnvVarContext context{{direct_receive_test_env, value}};
+    EXPECT_EQ(kvikio::getenv_or(direct_receive_test_env, Mode::OFF), expected);
+  }
+}
+
+TEST(DefaultsTest, remote_direct_receive_mode_uses_default_when_unset)
+{
+  using Mode = kvikio::RemoteDirectReceiveMode;
+  unsetenv(std::string{direct_receive_test_env}.c_str());
+  EXPECT_EQ(kvikio::getenv_or(direct_receive_test_env, Mode::PREFER), Mode::PREFER);
+}
+
+TEST(DefaultsTest, invalid_remote_direct_receive_mode_throws)
+{
+  using Mode = kvikio::RemoteDirectReceiveMode;
+  for (auto const& value : {"on", "true", "best_effort", "strict", ""}) {
+    kvikio::test::EnvVarContext context{{direct_receive_test_env, value}};
+    EXPECT_THROW(kvikio::getenv_or(direct_receive_test_env, Mode::OFF), std::invalid_argument)
+      << "value: " << value;
+  }
+}
+
+TEST(DefaultsTest, remote_direct_receive_mode_round_trip)
+{
+  using Mode = kvikio::RemoteDirectReceiveMode;
+  RestoreDirectReceiveMode const restore;
+  kvikio::defaults::set_remote_direct_receive_mode(Mode::PREFER);
+  EXPECT_EQ(kvikio::defaults::remote_direct_receive_mode(), Mode::PREFER);
+  kvikio::defaults::set_remote_direct_receive_mode(Mode::REQUIRE);
+  EXPECT_EQ(kvikio::defaults::remote_direct_receive_mode(), Mode::REQUIRE);
+}
 
 TEST(DefaultsTest, parse_compat_mode_str)
 {

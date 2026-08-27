@@ -33,6 +33,7 @@ class DirectReceiveSlotPool;
 // Forward declarations of the remote-IO selector enums.
 enum class RemoteIOBackend : uint8_t;
 enum class RemoteReactorDispatch : uint8_t;
+enum class RemoteDirectReceiveMode : uint8_t;
 
 template <typename T>
 T getenv_or(std::string_view env_var_name, T default_val)
@@ -67,6 +68,10 @@ RemoteIOBackend getenv_or(std::string_view env_var_name, RemoteIOBackend default
 
 template <>
 RemoteReactorDispatch getenv_or(std::string_view env_var_name, RemoteReactorDispatch default_val);
+
+template <>
+RemoteDirectReceiveMode getenv_or(std::string_view env_var_name,
+                                  RemoteDirectReceiveMode default_val);
 
 /**
  * @brief Get the environment variable value from a candidate list
@@ -143,6 +148,7 @@ class defaults {
   unsigned int _remote_io_num_reactors;
   RemoteReactorDispatch _remote_io_reactor_dispatch;
   std::size_t _remote_io_max_concurrent_requests;
+  RemoteDirectReceiveMode _remote_direct_receive_mode;
   std::size_t _remote_direct_receive_slot_size;
   std::size_t _remote_direct_receive_max_pinned_bytes;
   mutable std::mutex _remote_direct_receive_slot_pool_config_mutex;
@@ -536,6 +542,19 @@ class defaults {
    * @return The configured concurrent-request ceiling, or 0 for unlimited.
    */
   [[nodiscard]] static std::size_t remote_io_max_concurrent_requests();
+
+  /**
+   * @brief Policy for the experimental caller-owned kTLS receive path.
+   *
+   * Controlled by `KVIKIO_REMOTE_DIRECT_RECEIVE`, parsed case-insensitively as `OFF`, `PREFER`, or
+   * `REQUIRE`. The default is `OFF`.
+   */
+  [[nodiscard]] static RemoteDirectReceiveMode remote_direct_receive_mode();
+
+  /**
+   * @brief Set the caller-owned kTLS receive policy before starting concurrent remote I/O.
+   */
+  static void set_remote_direct_receive_mode(RemoteDirectReceiveMode mode);
 
   /**
    * @brief Size of each portable CUDA-pinned direct-receive streaming slot.

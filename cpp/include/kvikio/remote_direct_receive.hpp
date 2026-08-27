@@ -11,6 +11,18 @@
 namespace kvikio {
 
 /**
+ * @brief Policy for the experimental caller-owned remote receive path.
+ *
+ * `PREFER` permits only a classified fallback before response body bytes have been accepted.
+ * `REQUIRE` makes failure to activate strict receive observable instead of silently copying.
+ */
+enum class RemoteDirectReceiveMode : std::uint8_t {
+  OFF     = 0,  ///< Use the ordinary remote receive path.
+  PREFER  = 1,  ///< Prefer strict receive and permit a classified pre-body fallback.
+  REQUIRE = 2,  ///< Fail unless strict receive activates for the transfer.
+};
+
+/**
  * @brief Counters for the experimental caller-owned remote receive path.
  *
  * Counters are cumulative within one loaded KvikIO library instance and deliberately separate
