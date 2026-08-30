@@ -30,9 +30,16 @@ std::size_t HttpRetryPolicy::max_attempts() const noexcept { return _max_attempt
 
 bool HttpRetryPolicy::is_retryable(CURLcode curl_code, long http_code) const
 {
-  // TODO: Currently the timeout is the only libcurl transport error treated as retryable. Need to
-  // revisit and add more candidates.
+  // A terminal send or receive error with no HTTP response can mean libcurl exhausted its own
+  // retries over dead cached connections. In particular, libcurl can retain the original
+  // CURLE_RECV_ERROR even when its final internal retry attempt produces CURLE_SEND_ERROR.
+  // RemoteHandle only issues idempotent reads (plus the idempotent IMDSv2 token request), so
+  // retrying at this layer on a fresh connection is safe. Requiring response code zero keeps HTTP
+  // failures on the existing status-code policy.
   if (curl_code == CURLE_OPERATION_TIMEDOUT) { return true; }
+  if ((curl_code == CURLE_SEND_ERROR || curl_code == CURLE_RECV_ERROR) && http_code == 0) {
+    return true;
+  }
   return std::find(_retryable_status_codes.begin(),
                    _retryable_status_codes.end(),
                    static_cast<int>(http_code)) != _retryable_status_codes.end();
@@ -53,9 +60,14 @@ RetryOutcome HttpRetryPolicy::evaluate(CURLcode curl_code,
 {
   KVIKIO_EXPECT(attempt > 0, "attempt must be a positive integer", std::invalid_argument);
 
+  bool const fresh_connection =
+    (curl_code == CURLE_SEND_ERROR || curl_code == CURLE_RECV_ERROR) && http_code == 0;
+
   // We set CURLE_HTTP_RETURNED_ERROR, so >= 400 status codes are considered errors, so anything
   // less than this is considered a success and we're done.
-  if (curl_code == CURLE_OK) { return {RetryDecision::SUCCESS, std::chrono::milliseconds{0}, {}}; }
+  if (curl_code == CURLE_OK) {
+    return {RetryDecision::SUCCESS, false, std::chrono::milliseconds{0}, {}};
+  }
 
   if (!is_retryable(curl_code, http_code)) {
     std::stringstream ss;
@@ -65,7 +77,7 @@ RetryOutcome HttpRetryPolicy::evaluate(CURLcode curl_code,
     } else {
       ss << "(" << curl_error_message << ")";
     }
-    return {RetryDecision::FATAL, std::chrono::milliseconds{0}, ss.str()};
+    return {RetryDecision::FATAL, false, std::chrono::milliseconds{0}, ss.str()};
   }
 
   if (attempt >= _max_attempts) {
@@ -74,10 +86,12 @@ RetryOutcome HttpRetryPolicy::evaluate(CURLcode curl_code,
        << "). Reason: ";
     if (curl_code == CURLE_OPERATION_TIMEDOUT) {
       ss << "Operation timed out.";
+    } else if (fresh_connection) {
+      ss << "Transport failed before an HTTP response.";
     } else {
       ss << "Got HTTP code " << http_code << ".";
     }
-    return {RetryDecision::EXHAUSTED, std::chrono::milliseconds{0}, ss.str()};
+    return {RetryDecision::EXHAUSTED, false, std::chrono::milliseconds{0}, ss.str()};
   }
 
   auto const delay_ms = backoff_for(attempt);
@@ -85,11 +99,14 @@ RetryOutcome HttpRetryPolicy::evaluate(CURLcode curl_code,
   if (curl_code == CURLE_OPERATION_TIMEDOUT) {
     ss << "KvikIO: Timeout error. Retrying after " << delay_ms.count() << "ms (attempt " << attempt
        << " of " << _max_attempts << ").";
+  } else if (fresh_connection) {
+    ss << "KvikIO: Transport failed before an HTTP response. Retrying on a fresh connection after "
+       << delay_ms.count() << "ms (attempt " << attempt << " of " << _max_attempts << ").";
   } else {
     ss << "KvikIO: Got HTTP code " << http_code << ". Retrying after " << delay_ms.count()
        << "ms (attempt " << attempt << " of " << _max_attempts << ").";
   }
-  return {RetryDecision::RETRY, delay_ms, ss.str()};
+  return {RetryDecision::RETRY, fresh_connection, delay_ms, ss.str()};
 }
 
 }  // namespace kvikio::detail

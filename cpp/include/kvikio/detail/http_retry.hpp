@@ -31,6 +31,15 @@ struct RetryOutcome {
   RetryDecision decision{RetryDecision::FATAL};
 
   /**
+   * @brief Whether a retry must bypass libcurl's connection cache.
+   *
+   * This is meaningful only when `decision == RetryDecision::RETRY`. Transport failures that
+   * exhaust libcurl's stale-connection retry loop need a genuinely fresh connection; ordinary
+   * retryable HTTP responses may continue to use the connection cache.
+   */
+  bool fresh_connection{false};
+
+  /**
    * @brief How long to wait before the next attempt. Meaningful only when `decision` is `RETRY`.
    */
   std::chrono::milliseconds delay_ms{0};

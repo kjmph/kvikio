@@ -179,6 +179,7 @@ void CurlHandle::perform(std::function<void()> const& on_retry)
       case detail::RetryDecision::SUCCESS: return;
       case detail::RetryDecision::RETRY:
         KVIKIO_LOG_WARN(outcome.message);
+        if (outcome.fresh_connection) { setopt(CURLOPT_FRESH_CONNECT, 1L); }
         if (on_retry) { on_retry(); }
         std::this_thread::sleep_for(outcome.delay_ms);
         break;

@@ -1318,6 +1318,7 @@ void MultiPollReactor::io_thread_main()
               } else {
                 earliest_ready_at = ready_at;
               }
+              if (outcome.fresh_connection) { transfer->curl->setopt(CURLOPT_FRESH_CONNECT, 1L); }
               requeue_for_retry(std::move(transfer), ready_at);
               continue;
             }

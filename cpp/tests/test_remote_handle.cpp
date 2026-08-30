@@ -4,6 +4,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
@@ -20,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -305,6 +307,239 @@ class LocalHttpServer {
   bool _resume_body{};
 };
 
+// Creates a deterministic pool of stale HTTP/1.1 keep-alive connections. The first
+// `stale_connection_count` connections return one valid range response and then reset the socket
+// when libcurl reuses it for another request, without sending any response bytes. A later fresh
+// connection succeeds. This reproduces libcurl exhausting CONN_MAX_RETRIES over a large stale
+// connection cache before returning a transport failure to KvikIO.
+class StaleKeepAliveServer {
+ public:
+  explicit StaleKeepAliveServer(std::string body, std::size_t stale_connection_count = 6)
+    : _body{std::move(body)}, _stale_connection_count{stale_connection_count}
+  {
+    _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (_listen_fd < 0) { throw std::runtime_error(std::strerror(errno)); }
+
+    int reuse = 1;
+    if (::setsockopt(_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+      auto const message = std::string{std::strerror(errno)};
+      ::close(_listen_fd);
+      _listen_fd = -1;
+      throw std::runtime_error(message);
+    }
+
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port        = 0;
+    if (::bind(_listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::listen(_listen_fd, static_cast<int>(_stale_connection_count + 2)) != 0) {
+      auto const message = std::string{std::strerror(errno)};
+      ::close(_listen_fd);
+      _listen_fd = -1;
+      throw std::runtime_error(message);
+    }
+
+    socklen_t address_length = sizeof(address);
+    if (::getsockname(_listen_fd, reinterpret_cast<sockaddr*>(&address), &address_length) != 0) {
+      auto const message = std::string{std::strerror(errno)};
+      ::close(_listen_fd);
+      _listen_fd = -1;
+      throw std::runtime_error(message);
+    }
+    _port          = ntohs(address.sin_port);
+    _accept_thread = std::thread{[this] { accept_connections(); }};
+  }
+
+  ~StaleKeepAliveServer()
+  {
+    _stopping.store(true, std::memory_order_release);
+    _prime_cv.notify_all();
+    if (_listen_fd >= 0) {
+      ::shutdown(_listen_fd, SHUT_RDWR);
+      ::close(_listen_fd);
+      _listen_fd = -1;
+    }
+    {
+      std::lock_guard lock{_clients_mutex};
+      for (auto const client : _active_clients) {
+        ::shutdown(client, SHUT_RDWR);
+      }
+    }
+    if (_accept_thread.joinable()) { _accept_thread.join(); }
+    for (auto& thread : _client_threads) {
+      if (thread.joinable()) { thread.join(); }
+    }
+  }
+
+  [[nodiscard]] uint16_t port() const noexcept { return _port; }
+
+  [[nodiscard]] std::size_t connections_accepted() const noexcept
+  {
+    return _connections_accepted.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] std::size_t stale_reuses_closed() const noexcept
+  {
+    return _stale_reuses_closed.load(std::memory_order_acquire);
+  }
+
+ private:
+  static bool send_all(int fd, char const* data, std::size_t size)
+  {
+    while (size != 0) {
+      auto const sent = ::send(fd, data, size, MSG_NOSIGNAL);
+      if (sent <= 0) { return false; }
+      data += sent;
+      size -= static_cast<std::size_t>(sent);
+    }
+    return true;
+  }
+
+  [[nodiscard]] static std::string read_request(int fd)
+  {
+    std::string request;
+    std::array<char, 4096> buffer{};
+    while (request.find("\r\n\r\n") == std::string::npos && request.size() < 64 * 1024) {
+      auto const received = ::recv(fd, buffer.data(), buffer.size(), 0);
+      if (received <= 0) { return {}; }
+      request.append(buffer.data(), static_cast<std::size_t>(received));
+    }
+    return request;
+  }
+
+  [[nodiscard]] static std::optional<std::pair<std::size_t, std::size_t>> requested_range(
+    std::string_view request)
+  {
+    constexpr std::string_view prefix{"Range: bytes="};
+    auto const prefix_begin = request.find(prefix);
+    if (prefix_begin == std::string_view::npos) { return std::nullopt; }
+    auto const value_begin = prefix_begin + prefix.size();
+    auto const value_end   = request.find("\r\n", value_begin);
+    if (value_end == std::string_view::npos) { return std::nullopt; }
+    auto const value = request.substr(value_begin, value_end - value_begin);
+    auto const dash  = value.find('-');
+    if (dash == std::string_view::npos) { return std::nullopt; }
+
+    std::size_t first{};
+    std::size_t last{};
+    auto const [first_end, first_error] = std::from_chars(value.data(), value.data() + dash, first);
+    auto const [last_end, last_error] =
+      std::from_chars(value.data() + dash + 1, value.data() + value.size(), last);
+    if (first_error != std::errc{} || last_error != std::errc{} ||
+        first_end != value.data() + dash || last_end != value.data() + value.size() ||
+        first > last) {
+      return std::nullopt;
+    }
+    return std::pair{first, last};
+  }
+
+  [[nodiscard]] bool send_range_response(int client,
+                                         std::string_view request,
+                                         bool keep_alive) const
+  {
+    auto const range = requested_range(request);
+    if (!range.has_value() || range->second >= _body.size()) { return false; }
+    auto const response_size = range->second - range->first + 1;
+    auto const header        = std::string{"HTTP/1.1 206 Partial Content\r\nContent-Length: "} +
+                        std::to_string(response_size) + "\r\nContent-Range: bytes " +
+                        std::to_string(range->first) + "-" + std::to_string(range->second) + "/" +
+                        std::to_string(_body.size()) +
+                        "\r\nConnection: " + (keep_alive ? "keep-alive\r\n\r\n" : "close\r\n\r\n");
+    return send_all(client, header.data(), header.size()) &&
+           send_all(client, _body.data() + range->first, response_size);
+  }
+
+  void close_client(int client, bool reset) noexcept
+  {
+    {
+      std::lock_guard lock{_clients_mutex};
+      _active_clients.erase(client);
+    }
+    if (reset) {
+      linger reset_linger{1, 0};
+      std::ignore =
+        ::setsockopt(client, SOL_SOCKET, SO_LINGER, &reset_linger, sizeof(reset_linger));
+    } else {
+      ::shutdown(client, SHUT_RDWR);
+    }
+    ::close(client);
+  }
+
+  void serve_client(int client, std::size_t connection_index)
+  {
+    auto const first_request = read_request(client);
+    if (first_request.empty()) {
+      close_client(client, false);
+      return;
+    }
+
+    bool const stale_connection = connection_index < _stale_connection_count;
+    if (stale_connection) {
+      {
+        std::unique_lock lock{_prime_mutex};
+        ++_primed_connections;
+        _prime_cv.notify_all();
+        _prime_cv.wait(lock, [this] {
+          return _primed_connections >= _stale_connection_count ||
+                 _stopping.load(std::memory_order_acquire);
+        });
+      }
+      if (_stopping.load(std::memory_order_acquire) ||
+          !send_range_response(client, first_request, true)) {
+        close_client(client, false);
+        return;
+      }
+
+      // The socket remains healthy while libcurl caches it. Reset it only after the next request
+      // has arrived, ensuring libcurl has selected a reused connection and has received no
+      // response.
+      if (!read_request(client).empty()) {
+        _stale_reuses_closed.fetch_add(1, std::memory_order_release);
+      }
+      close_client(client, true);
+      return;
+    }
+
+    std::ignore = send_range_response(client, first_request, false);
+    close_client(client, false);
+  }
+
+  void accept_connections()
+  {
+    while (!_stopping.load(std::memory_order_acquire)) {
+      auto const client = ::accept(_listen_fd, nullptr, nullptr);
+      if (client < 0) { return; }
+      auto const connection_index = _connections_accepted.fetch_add(1, std::memory_order_acq_rel);
+      {
+        std::lock_guard lock{_clients_mutex};
+        if (_stopping.load(std::memory_order_acquire)) {
+          ::close(client);
+          return;
+        }
+        _active_clients.insert(client);
+      }
+      _client_threads.emplace_back(
+        [this, client, connection_index] { serve_client(client, connection_index); });
+    }
+  }
+
+  std::string _body;
+  std::size_t _stale_connection_count;
+  int _listen_fd{-1};
+  uint16_t _port{};
+  std::atomic<bool> _stopping{};
+  std::atomic<std::size_t> _connections_accepted{};
+  std::atomic<std::size_t> _stale_reuses_closed{};
+  std::thread _accept_thread;
+  std::vector<std::thread> _client_threads;
+  std::mutex _clients_mutex;
+  std::unordered_set<int> _active_clients;
+  std::mutex _prime_mutex;
+  std::condition_variable _prime_cv;
+  std::size_t _primed_connections{};
+};
+
 template <typename Predicate>
 [[nodiscard]] bool wait_until(Predicate&& predicate, std::chrono::milliseconds timeout)
 {
@@ -526,6 +761,53 @@ class RestoreHttpRetryPolicy {
   long _timeout;
   std::vector<int> _status_codes;
 };
+
+void expect_multi_poll_retry_after_stale_connection_exhaustion(
+  kvikio::RemoteDirectReceiveMode direct_receive_mode)
+{
+  RestoreRemoteIoBackend const restore_backend;
+  RestoreRemoteDirectReceiveMode const restore_mode;
+  RestoreHttpRetryPolicy const restore_retry;
+  kvikio::defaults::set_remote_io_backend(kvikio::RemoteIOBackend::MULTI_POLL);
+  kvikio::defaults::set_remote_direct_receive_mode(direct_receive_mode);
+  kvikio::defaults::set_http_max_attempts(2);
+  kvikio::defaults::set_http_status_codes({});
+
+  constexpr std::size_t stale_connections          = 7;
+  constexpr std::size_t internally_failed_attempts = 6;
+  constexpr std::size_t task_size                  = 257;
+  std::string body(stale_connections * task_size, '\0');
+  for (std::size_t i = 0; i < body.size(); ++i) {
+    body[i] = static_cast<char>((i * 149U + 37U) & 0xffU);
+  }
+
+  StaleKeepAliveServer server{body, stale_connections};
+  auto endpoint = std::make_unique<kvikio::HttpEndpoint>(
+    "http://127.0.0.1:" + std::to_string(server.port()) + "/object");
+  kvikio::RemoteHandle remote_handle(std::move(endpoint), body.size());
+
+  // Populate one reactor's cache with more stale connections than libcurl's internal retry budget.
+  // The server holds all first responses behind a barrier so libcurl cannot serialize requests on
+  // fewer connections.
+  std::vector<char> primed(body.size(), '\0');
+  auto prime = remote_handle.pread(primed.data(), primed.size(), 0, task_size);
+  ASSERT_EQ(prime.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+  ASSERT_EQ(prime.get(), body.size());
+  ASSERT_EQ(primed, std::vector<char>(body.begin(), body.end()));
+  ASSERT_EQ(server.connections_accepted(), stale_connections);
+
+  // Every cached connection now resets after accepting its second request. Libcurl consumes six,
+  // exhausts its internal retry budget, and leaves the original CURLE_RECV_ERROR as the multi
+  // result. KvikIO's bounded outer retry must bypass the seventh stale cached connection and open
+  // an eighth, genuinely fresh connection.
+  std::vector<char> output(task_size, '\0');
+  auto retried = remote_handle.pread(output.data(), output.size(), 0, output.size());
+  ASSERT_EQ(retried.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+  EXPECT_EQ(retried.get(), output.size());
+  EXPECT_EQ(output, std::vector<char>(body.begin(), body.begin() + task_size));
+  EXPECT_EQ(server.stale_reuses_closed(), internally_failed_attempts);
+  EXPECT_EQ(server.connections_accepted(), stale_connections + 1);
+}
 
 class RemoteHandleTest : public testing::Test {
  protected:
@@ -785,6 +1067,24 @@ TEST_F(RemoteHandleTest, completion_future_failure_precedes_device_transfer_subm
   // handoff. No asynchronous work can retain the caller-owned destination.
   EXPECT_EQ(endpoint_ptr->setopt_calls, 1);
   EXPECT_EQ(endpoint_ptr->range_request_calls, 1);
+}
+
+TEST_F(RemoteHandleTest, multi_poll_retries_exhausted_stale_connections_on_a_fresh_connection)
+{
+  expect_multi_poll_retry_after_stale_connection_exhaustion(kvikio::RemoteDirectReceiveMode::OFF);
+}
+
+TEST_F(RemoteHandleTest,
+       multi_poll_direct_receive_retries_exhausted_stale_connections_on_a_fresh_connection)
+{
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+  kvikio::reset_remote_direct_receive_stats();
+  expect_multi_poll_retry_after_stale_connection_exhaustion(
+    kvikio::RemoteDirectReceiveMode::PREFER);
+  EXPECT_EQ(kvikio::remote_direct_receive_stats().retries, 1);
+#else
+  GTEST_SKIP() << "libcurl does not provide caller-owned strict receive support";
+#endif
 }
 
 TEST_F(RemoteHandleTest, multi_poll_copied_stream_rotates_one_bounded_direct_receive_slot)

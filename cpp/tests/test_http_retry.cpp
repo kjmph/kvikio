@@ -38,6 +38,40 @@ TEST(HttpRetryTest, retryable_curl_timeout)
   auto const outcome =
     unlimited_policy().evaluate(CURLE_OPERATION_TIMEDOUT, 0, 1, "", error_prefix);
   EXPECT_EQ(outcome.decision, RetryDecision::RETRY);
+  EXPECT_FALSE(outcome.fresh_connection);
+}
+
+TEST(HttpRetryTest, send_error_without_http_response_retries_on_fresh_connection)
+{
+  auto const outcome = unlimited_policy().evaluate(
+    CURLE_SEND_ERROR, 0, 1, "Connection died, tried 5 times before giving up", error_prefix);
+  EXPECT_EQ(outcome.decision, RetryDecision::RETRY);
+  EXPECT_TRUE(outcome.fresh_connection);
+  EXPECT_NE(outcome.message.find("fresh connection"), std::string::npos);
+}
+
+TEST(HttpRetryTest, receive_error_without_http_response_retries_on_fresh_connection)
+{
+  auto const outcome = unlimited_policy().evaluate(
+    CURLE_RECV_ERROR, 0, 1, "Connection died, tried 5 times before giving up", error_prefix);
+  EXPECT_EQ(outcome.decision, RetryDecision::RETRY);
+  EXPECT_TRUE(outcome.fresh_connection);
+  EXPECT_NE(outcome.message.find("fresh connection"), std::string::npos);
+}
+
+TEST(HttpRetryTest, transport_error_with_http_response_uses_status_policy)
+{
+  auto const policy = unlimited_policy();
+
+  for (auto const curl_code : {CURLE_SEND_ERROR, CURLE_RECV_ERROR}) {
+    auto const throttled = policy.evaluate(curl_code, 503, 1, "transport failed", error_prefix);
+    EXPECT_EQ(throttled.decision, RetryDecision::RETRY);
+    EXPECT_FALSE(throttled.fresh_connection);
+
+    auto const forbidden = policy.evaluate(curl_code, 403, 1, "transport failed", error_prefix);
+    EXPECT_EQ(forbidden.decision, RetryDecision::FATAL);
+    EXPECT_FALSE(forbidden.fresh_connection);
+  }
 }
 
 TEST(HttpRetryTest, retryable_http_code)
@@ -59,8 +93,8 @@ TEST(HttpRetryTest, non_retryable_failures)
     EXPECT_EQ(outcome.decision, RetryDecision::FATAL);
   }
 
-  // Transport errors that are not timeouts.
-  for (auto const curl_code : {CURLE_COULDNT_RESOLVE_HOST, CURLE_WRITE_ERROR, CURLE_RECV_ERROR}) {
+  // Transport errors outside the bounded timeout and connection-failure policy.
+  for (auto const curl_code : {CURLE_COULDNT_RESOLVE_HOST, CURLE_WRITE_ERROR}) {
     auto const outcome = policy.evaluate(curl_code, 0, 1, "", error_prefix);
     EXPECT_EQ(outcome.decision, RetryDecision::FATAL);
   }
@@ -102,6 +136,18 @@ TEST(HttpRetryTest, single_attempt_budget_never_retries)
   HttpRetryPolicy const policy{1, default_status_codes()};
   auto const outcome = policy.evaluate(CURLE_HTTP_RETURNED_ERROR, 503, 1, "", error_prefix);
   EXPECT_EQ(outcome.decision, RetryDecision::EXHAUSTED);
+}
+
+TEST(HttpRetryTest, single_attempt_budget_exhausts_transport_error_without_retrying)
+{
+  HttpRetryPolicy const policy{1, default_status_codes()};
+  for (auto const curl_code : {CURLE_SEND_ERROR, CURLE_RECV_ERROR}) {
+    auto const outcome = policy.evaluate(
+      curl_code, 0, 1, "Connection died, tried 5 times before giving up", error_prefix);
+    EXPECT_EQ(outcome.decision, RetryDecision::EXHAUSTED);
+    EXPECT_FALSE(outcome.fresh_connection);
+    EXPECT_NE(outcome.message.find("before an HTTP response"), std::string::npos);
+  }
 }
 
 TEST(HttpRetryTest, budget_is_spent_on_the_last_attempt)
