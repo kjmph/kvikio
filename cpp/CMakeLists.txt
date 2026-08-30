@@ -194,6 +194,7 @@ if(KvikIO_REMOTE_SUPPORT)
   list(
     APPEND
     SOURCES
+    "src/aws_credential_provider.cpp"
     "src/hdfs.cpp"
     "src/remote_handle.cpp"
     "src/detail/direct_receive.cpp"

@@ -18,6 +18,7 @@
 #include <string>
 #include <utility>
 
+#include <kvikio/aws_credential_provider.hpp>
 #include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
 #include <kvikio/detail/cuda_fence.hpp>
@@ -336,9 +337,13 @@ std::unique_ptr<RemoteEndpoint> create_endpoint_from_type(std::string const& url
       if (!S3Endpoint::is_url_valid(url)) { return nullptr; }
       if (scheme == "s3") {
         auto const [bucket, object] = S3Endpoint::parse_s3_url(url);
-        return std::make_unique<S3Endpoint>(std::pair{bucket, object});
+        return S3Endpoint::create_with_credential_provider(std::pair{bucket, object},
+                                                           std::nullopt,
+                                                           std::nullopt,
+                                                           make_default_aws_credential_provider());
       }
-      return std::make_unique<S3Endpoint>(url);
+      return S3Endpoint::create_with_credential_provider(
+        url, std::nullopt, make_default_aws_credential_provider());
 
     case RemoteEndpointType::S3_PUBLIC:
       if (!S3PublicEndpoint::is_url_valid(url)) { return nullptr; }
@@ -449,8 +454,14 @@ void S3Endpoint::setopt(CurlHandle& curl)
   curl.setopt(CURLOPT_URL, new_url.c_str());
 
   curl.setopt(CURLOPT_AWS_SIGV4, _aws_sigv4.c_str());
-  curl.setopt(CURLOPT_USERPWD, _aws_userpwd.c_str());
-  if (_session_token_header.has_value()) { curl.append_http_header(_session_token_header.value()); }
+  auto const auth = _credential_provider->get_auth_material();
+  KVIKIO_EXPECT(auth != nullptr,
+                "S3 credential provider returned no authentication material",
+                std::runtime_error);
+  curl.setopt(CURLOPT_USERPWD, auth->userpwd.c_str());
+  if (auth->session_token_header.has_value()) {
+    curl.append_http_header(*auth->session_token_header);
+  }
 }
 
 std::string S3Endpoint::url_from_bucket_and_object(std::string bucket_name,
@@ -487,12 +498,16 @@ std::pair<std::string, std::string> S3Endpoint::parse_s3_url(std::string const& 
 
 S3Endpoint::S3Endpoint(std::string url,
                        std::optional<std::string> aws_region,
-                       std::optional<std::string> aws_access_key,
-                       std::optional<std::string> aws_secret_access_key,
-                       std::optional<std::string> aws_session_token)
-  : RemoteEndpoint{RemoteEndpointType::S3}, _url{std::move(url)}
+                       std::shared_ptr<AwsCredentialProvider> credential_provider,
+                       CredentialProviderTag)
+  : RemoteEndpoint{RemoteEndpointType::S3},
+    _url{std::move(url)},
+    _credential_provider{std::move(credential_provider)}
 {
   KVIKIO_NVTX_FUNC_RANGE();
+  KVIKIO_EXPECT(_credential_provider != nullptr,
+                "S3 credential provider must not be null",
+                std::invalid_argument);
   // Regular expression to match http[s]://
   std::regex static const pattern{R"(^https?://.*)", std::regex_constants::icase};
   KVIKIO_EXPECT(std::regex_search(_url, pattern),
@@ -503,46 +518,67 @@ S3Endpoint::S3Endpoint(std::string url,
     std::move(aws_region),
     "S3: must provide `aws_region` if AWS_REGION and AWS_DEFAULT_REGION aren't set.");
 
-  auto const access_key =
-    detail::unwrap_or_env(std::move(aws_access_key),
-                          "AWS_ACCESS_KEY_ID",
-                          "S3: must provide `aws_access_key` if AWS_ACCESS_KEY_ID isn't set.");
-
-  auto const secret_access_key = detail::unwrap_or_env(
-    std::move(aws_secret_access_key),
-    "AWS_SECRET_ACCESS_KEY",
-    "S3: must provide `aws_secret_access_key` if AWS_SECRET_ACCESS_KEY isn't set.");
-
   // Create the CURLOPT_AWS_SIGV4 option
   {
     std::stringstream ss;
     ss << "aws:amz:" << region.value() << ":s3";
     _aws_sigv4 = ss.str();
   }
-  // Create the CURLOPT_USERPWD option
-  // Notice, curl uses `secret_access_key` to generate a AWS V4 signature. It is NOT included
-  // in the http header. See
-  // <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html>
-  {
-    std::stringstream ss;
-    ss << access_key.value() << ":" << secret_access_key.value();
-    _aws_userpwd = ss.str();
-  }
-  auto const session_token =
-    detail::unwrap_or_env(std::move(aws_session_token), "AWS_SESSION_TOKEN");
-  // Access key IDs beginning with ASIA are temporary credentials that are created using AWS STS
-  // operations. They require a session token. Other credential providers and S3-compatible stores
-  // may use a different key prefix, so forward any explicitly supplied token as well.
-  if (access_key->compare(0, 4, std::string("ASIA")) == 0) {
-    KVIKIO_EXPECT(session_token.has_value(),
-                  "When using temporary credentials, AWS_SESSION_TOKEN must be set.",
-                  std::invalid_argument);
-  }
-  if (session_token.has_value()) {
-    std::stringstream ss;
-    ss << "x-amz-security-token: " << session_token.value();
-    _session_token_header = ss.str();
-  }
+}
+
+std::unique_ptr<S3Endpoint> S3Endpoint::create_with_credential_provider(
+  std::string url,
+  std::optional<std::string> aws_region,
+  std::shared_ptr<AwsCredentialProvider> credential_provider)
+{
+  return std::unique_ptr<S3Endpoint>{new S3Endpoint(std::move(url),
+                                                    std::move(aws_region),
+                                                    std::move(credential_provider),
+                                                    CredentialProviderTag{})};
+}
+
+S3Endpoint::S3Endpoint(std::string url,
+                       std::optional<std::string> aws_region,
+                       std::optional<std::string> aws_access_key,
+                       std::optional<std::string> aws_secret_access_key,
+                       std::optional<std::string> aws_session_token)
+  : S3Endpoint(
+      std::move(url),
+      aws_region,
+      make_legacy_env_and_args_credential_provider(
+        std::move(aws_access_key), std::move(aws_secret_access_key), std::move(aws_session_token)),
+      CredentialProviderTag{})
+{
+  KVIKIO_NVTX_FUNC_RANGE();
+}
+
+S3Endpoint::S3Endpoint(std::pair<std::string, std::string> bucket_and_object_names,
+                       std::optional<std::string> aws_region,
+                       std::optional<std::string> aws_endpoint_url,
+                       std::shared_ptr<AwsCredentialProvider> credential_provider,
+                       CredentialProviderTag)
+  : S3Endpoint(url_from_bucket_and_object(std::move(bucket_and_object_names.first),
+                                          std::move(bucket_and_object_names.second),
+                                          aws_region,
+                                          std::move(aws_endpoint_url)),
+               aws_region,
+               std::move(credential_provider),
+               CredentialProviderTag{})
+{
+  KVIKIO_NVTX_FUNC_RANGE();
+}
+
+std::unique_ptr<S3Endpoint> S3Endpoint::create_with_credential_provider(
+  std::pair<std::string, std::string> bucket_and_object_names,
+  std::optional<std::string> aws_region,
+  std::optional<std::string> aws_endpoint_url,
+  std::shared_ptr<AwsCredentialProvider> credential_provider)
+{
+  return std::unique_ptr<S3Endpoint>{new S3Endpoint(std::move(bucket_and_object_names),
+                                                    std::move(aws_region),
+                                                    std::move(aws_endpoint_url),
+                                                    std::move(credential_provider),
+                                                    CredentialProviderTag{})};
 }
 
 S3Endpoint::S3Endpoint(std::pair<std::string, std::string> bucket_and_object_names,
@@ -551,14 +587,15 @@ S3Endpoint::S3Endpoint(std::pair<std::string, std::string> bucket_and_object_nam
                        std::optional<std::string> aws_secret_access_key,
                        std::optional<std::string> aws_endpoint_url,
                        std::optional<std::string> aws_session_token)
-  : S3Endpoint(url_from_bucket_and_object(std::move(bucket_and_object_names.first),
-                                          std::move(bucket_and_object_names.second),
-                                          aws_region,
-                                          std::move(aws_endpoint_url)),
-               aws_region,
-               std::move(aws_access_key),
-               std::move(aws_secret_access_key),
-               std::move(aws_session_token))
+  : S3Endpoint(
+      url_from_bucket_and_object(std::move(bucket_and_object_names.first),
+                                 std::move(bucket_and_object_names.second),
+                                 aws_region,
+                                 std::move(aws_endpoint_url)),
+      aws_region,
+      make_legacy_env_and_args_credential_provider(
+        std::move(aws_access_key), std::move(aws_secret_access_key), std::move(aws_session_token)),
+      CredentialProviderTag{})
 {
   KVIKIO_NVTX_FUNC_RANGE();
 }

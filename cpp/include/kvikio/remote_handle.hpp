@@ -20,6 +20,7 @@
 namespace kvikio {
 
 class CurlHandle;  // Prototype
+class AwsCredentialProvider;
 namespace detail {
 class DirectReceiveObjectSnapshot;
 }
@@ -33,9 +34,10 @@ class DirectReceiveObjectSnapshot;
 enum class RemoteEndpointType : uint8_t {
   AUTO,  ///< Automatically detect the endpoint type from the URL. KvikIO will attempt to infer the
          ///< appropriate protocol based on the URL format.
-  S3,    ///< AWS S3 endpoint using credentials-based authentication. Requires AWS environment
-         ///< variables (such as AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION or
-         ///< AWS_DEFAULT_REGION) to be set.
+  S3,    ///< AWS S3 endpoint using credentials-based authentication. `RemoteHandle::open()` uses
+         ///< complete AWS environment credentials when present, otherwise refreshable EC2
+         ///< instance-profile credentials from IMDSv2. AWS_REGION or AWS_DEFAULT_REGION is still
+         ///< required for SigV4 signing.
   S3_PUBLIC,  ///< AWS S3 endpoint for publicly accessible objects. No credentials required as the
               ///< objects have public read permissions enabled. Used for open datasets and public
               ///< buckets.
@@ -211,14 +213,28 @@ class HttpEndpoint : public RemoteEndpoint {
  * @brief A remote endpoint for AWS S3 storage requiring credentials
  *
  * This endpoint is for accessing private S3 objects using AWS credentials (access key, secret key,
- * region and optional session token).
+ * region and optional session token). `RemoteHandle::open()` shares a process-wide default
+ * provider that uses complete environment credentials first and EC2 instance-profile credentials
+ * second. Applications can also supply a provider explicitly.
  */
 class S3Endpoint : public RemoteEndpoint {
  private:
+  struct CredentialProviderTag {};
+
   std::string _url;
   std::string _aws_sigv4;
-  std::string _aws_userpwd;
-  std::optional<std::string> _session_token_header;
+  std::shared_ptr<AwsCredentialProvider> _credential_provider;
+
+  S3Endpoint(std::string url,
+             std::optional<std::string> aws_region,
+             std::shared_ptr<AwsCredentialProvider> credential_provider,
+             CredentialProviderTag);
+
+  S3Endpoint(std::pair<std::string, std::string> bucket_and_object_names,
+             std::optional<std::string> aws_region,
+             std::optional<std::string> aws_endpoint_url,
+             std::shared_ptr<AwsCredentialProvider> credential_provider,
+             CredentialProviderTag);
 
  public:
   /**
@@ -259,7 +275,9 @@ class S3Endpoint : public RemoteEndpoint {
    * @param aws_region The AWS region, such as "us-east-1", to use. If nullopt, the value of the
    * `AWS_REGION` environment variable is used, falling back to `AWS_DEFAULT_REGION`.
    * @param aws_access_key The AWS access key to use. If nullopt, the value of the
-   * `AWS_ACCESS_KEY_ID` environment variable is used.
+   * `AWS_ACCESS_KEY_ID` environment variable is used. This legacy constructor does not fall back
+   * to EC2 instance-profile credentials; use `create_with_credential_provider()` for that
+   * behavior.
    * @param aws_secret_access_key The AWS secret access key to use. If nullopt, the value of the
    * `AWS_SECRET_ACCESS_KEY` environment variable is used.
    * @param aws_session_token The AWS session token to use. If nullopt, the value of the
@@ -272,13 +290,30 @@ class S3Endpoint : public RemoteEndpoint {
              std::optional<std::string> aws_session_token     = std::nullopt);
 
   /**
+   * @brief Create an S3 endpoint using a refreshable or application-defined credential provider.
+   *
+   * A named factory avoids introducing an overload ambiguity with the legacy optional-credential
+   * constructor for source calls that use an empty braced argument.
+   *
+   * @param url Full HTTP(S) URL to the S3 object.
+   * @param aws_region AWS region used for SigV4 signing.
+   * @param credential_provider Non-null credential provider consulted for every new request.
+   */
+  static std::unique_ptr<S3Endpoint> create_with_credential_provider(
+    std::string url,
+    std::optional<std::string> aws_region,
+    std::shared_ptr<AwsCredentialProvider> credential_provider);
+
+  /**
    * @brief Create a S3 endpoint from a bucket and object name.
    *
    * @param bucket_and_object_names The bucket and object names of the S3 bucket.
    * @param aws_region The AWS region, such as "us-east-1", to use. If nullopt, the value of the
    * `AWS_REGION` environment variable is used, falling back to `AWS_DEFAULT_REGION`.
    * @param aws_access_key The AWS access key to use. If nullopt, the value of the
-   * `AWS_ACCESS_KEY_ID` environment variable is used.
+   * `AWS_ACCESS_KEY_ID` environment variable is used. This legacy constructor does not fall back
+   * to EC2 instance-profile credentials; use `create_with_credential_provider()` for that
+   * behavior.
    * @param aws_secret_access_key The AWS secret access key to use. If nullopt, the value of the
    * `AWS_SECRET_ACCESS_KEY` environment variable is used.
    * @param aws_endpoint_url Overwrite the endpoint url (including the protocol part) by using
@@ -294,6 +329,15 @@ class S3Endpoint : public RemoteEndpoint {
              std::optional<std::string> aws_secret_access_key = std::nullopt,
              std::optional<std::string> aws_endpoint_url      = std::nullopt,
              std::optional<std::string> aws_session_token     = std::nullopt);
+
+  /**
+   * @brief Create an S3 endpoint from bucket and object names using a credential provider.
+   */
+  static std::unique_ptr<S3Endpoint> create_with_credential_provider(
+    std::pair<std::string, std::string> bucket_and_object_names,
+    std::optional<std::string> aws_region,
+    std::optional<std::string> aws_endpoint_url,
+    std::shared_ptr<AwsCredentialProvider> credential_provider);
 
   ~S3Endpoint() override = default;
   void setopt(CurlHandle& curl) override;
