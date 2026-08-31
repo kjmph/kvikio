@@ -382,7 +382,8 @@ TEST_F(DirectReceiveCudaTest, flattens_one_bounded_batch_and_records_each_barrie
   EXPECT_NO_THROW(second_barrier->sync_all_events());
 }
 
-TEST_F(DirectReceiveCudaTest, rejects_overlap_and_malformed_descriptors_before_taking_ownership)
+TEST_F(DirectReceiveCudaTest,
+       separates_independent_overlap_and_rejects_malformed_descriptors_before_taking_ownership)
 {
   auto pool      = make_pool(3);
   auto first     = pool->try_acquire();
@@ -391,26 +392,86 @@ TEST_F(DirectReceiveCudaTest, rejects_overlap_and_malformed_descriptors_before_t
   ASSERT_TRUE(first.has_value());
   ASSERT_TRUE(overlap.has_value());
   ASSERT_TRUE(malformed.has_value());
-  auto barrier = make_barrier();
+  auto first_barrier  = make_barrier();
+  auto second_barrier = make_barrier();
   DirectReceiveCudaBatch batch{current_context(), stream(), DirectReceiveCudaPath::strict_rx};
 
   auto first_released = released_slot({{0, 0, 4}}, 4);
-  EXPECT_EQ(batch.try_add(*first, first_released, 0x20000, 8, barrier, 1),
+  EXPECT_EQ(batch.try_add(*first, first_released, 0x20000, 8, first_barrier, 1),
             DirectReceiveCudaAddResult::added);
 
   auto overlapping = released_slot({{0, 0, 4}}, 4);
-  EXPECT_THROW(std::ignore = batch.try_add(*overlap, overlapping, 0x20002, 4, barrier, 2),
-               std::invalid_argument);
+  EXPECT_EQ(batch.try_add(*overlap, overlapping, 0x20002, 4, second_barrier, 2),
+            DirectReceiveCudaAddResult::batch_incompatible);
   EXPECT_TRUE(static_cast<bool>(*overlap));
   EXPECT_EQ(batch.slot_count(), 1);
   EXPECT_EQ(batch.copy_count(), 1);
 
   auto wrong_sum = released_slot({{0, 4, 2}}, 2);
   ++wrong_sum.body_bytes;
-  EXPECT_THROW(std::ignore = batch.try_add(*malformed, wrong_sum, 0x20000, 8, barrier, 3),
+  EXPECT_THROW(std::ignore = batch.try_add(*malformed, wrong_sum, 0x20000, 8, first_barrier, 3),
                std::invalid_argument);
   EXPECT_TRUE(static_cast<bool>(*malformed));
   EXPECT_EQ(batch.slot_count(), 1);
+}
+
+TEST_F(DirectReceiveCudaTest, rejects_overlap_across_slots_of_one_logical_read)
+{
+  auto pool   = make_pool(2);
+  auto first  = pool->try_acquire();
+  auto second = pool->try_acquire();
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  auto barrier = make_barrier();
+  DirectReceiveCudaBatch batch{current_context(), stream(), DirectReceiveCudaPath::strict_rx};
+
+  EXPECT_EQ(batch.try_add(*first, released_slot({{0, 0, 4}}, 4), 0x22000, 8, barrier, 1),
+            DirectReceiveCudaAddResult::added);
+  EXPECT_THROW(
+    std::ignore = batch.try_add(*second, released_slot({{0, 2, 4}}, 4), 0x22000, 8, barrier, 2),
+    std::invalid_argument);
+  EXPECT_TRUE(static_cast<bool>(*second));
+  EXPECT_EQ(batch.slot_count(), 1);
+  EXPECT_EQ(batch.copy_count(), 1);
+}
+
+TEST_F(DirectReceiveCudaTest, same_read_overlap_cannot_be_masked_by_an_independent_overlap)
+{
+  auto pool  = make_pool(3);
+  auto b     = pool->try_acquire();
+  auto a     = pool->try_acquire();
+  auto mixed = pool->try_acquire();
+  ASSERT_TRUE(b.has_value());
+  ASSERT_TRUE(a.has_value());
+  ASSERT_TRUE(mixed.has_value());
+  auto barrier_a = make_barrier();
+  auto barrier_b = make_barrier();
+  DirectReceiveCudaBatch batch{current_context(), stream(), DirectReceiveCudaPath::strict_rx};
+
+  EXPECT_EQ(batch.try_add(*b, released_slot({{0, 0, 4}}, 4), 0x23000, 4, barrier_b, 1),
+            DirectReceiveCudaAddResult::added);
+  EXPECT_EQ(batch.try_add(*a, released_slot({{0, 0, 4}}, 4), 0x23004, 4, barrier_a, 2),
+            DirectReceiveCudaAddResult::added);
+  EXPECT_THROW(
+    std::ignore = batch.try_add(*mixed, released_slot({{0, 0, 4}}, 4), 0x23002, 4, barrier_a, 3),
+    std::invalid_argument);
+  EXPECT_TRUE(static_cast<bool>(*mixed));
+  EXPECT_EQ(batch.slot_count(), 2);
+  EXPECT_EQ(batch.copy_count(), 2);
+}
+
+TEST_F(DirectReceiveCudaTest, rejects_overlap_within_one_released_slot)
+{
+  auto pool = make_pool(1);
+  auto slot = pool->try_acquire();
+  ASSERT_TRUE(slot.has_value());
+  DirectReceiveCudaBatch batch{current_context(), stream(), DirectReceiveCudaPath::strict_rx};
+
+  auto overlapping = released_slot({{0, 0, 3}, {4, 2, 2}}, 6);
+  EXPECT_THROW(std::ignore = batch.try_add(*slot, overlapping, 0x24000, 4, make_barrier(), 1),
+               std::invalid_argument);
+  EXPECT_TRUE(static_cast<bool>(*slot));
+  EXPECT_TRUE(batch.empty());
 }
 
 TEST_F(DirectReceiveCudaTest, rejects_bounds_overflow_context_and_noncontiguous_output)
@@ -523,7 +584,7 @@ TEST_F(DirectReceiveCudaTest, header_only_batch_completes_without_cuda_submissio
   EXPECT_EQ(batch.finished_cookies()[0], 88);
 }
 
-TEST_F(DirectReceiveCudaTest, accounts_each_successful_logical_batch_to_its_fixed_path)
+TEST_F(DirectReceiveCudaTest, accounts_each_successful_kvikio_batch_submission_to_its_fixed_path)
 {
   auto pool        = make_pool(2);
   auto strict_slot = pool->try_acquire();

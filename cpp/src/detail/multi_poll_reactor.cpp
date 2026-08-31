@@ -42,6 +42,17 @@ constexpr std::size_t failure_injection_disabled = std::numeric_limits<std::size
 std::atomic<std::size_t> submission_failure_countdown{failure_injection_disabled};
 std::atomic<std::size_t> admission_failure_countdown{failure_injection_disabled};
 std::atomic<std::size_t> reactor_construction_failure_countdown{failure_injection_disabled};
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+struct DirectReceiveSubmissionDeferral {
+  std::mutex mutex;
+  std::size_t remaining_logical_preads{};
+  std::array<std::shared_ptr<RemoteMultiAggregateContext>, direct_receive_max_slots_per_cuda_batch>
+    observed_aggregates{};
+  std::size_t observed_count{};
+};
+
+DirectReceiveSubmissionDeferral direct_receive_submission_deferral;
+#endif
 
 void maybe_inject_failure(std::atomic<std::size_t>& countdown)
 {
@@ -60,6 +71,38 @@ void maybe_inject_failure(std::atomic<std::size_t>& countdown)
     }
   }
 }
+
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+void observe_deferred_direct_receive_aggregate(
+  std::shared_ptr<RemoteMultiAggregateContext> const& aggregate) noexcept
+{
+  auto& deferral = direct_receive_submission_deferral;
+  std::lock_guard lock{deferral.mutex};
+  auto const observed_end = deferral.observed_aggregates.begin() + deferral.observed_count;
+  if (deferral.remaining_logical_preads == 0 ||
+      std::find(deferral.observed_aggregates.begin(), observed_end, aggregate) != observed_end) {
+    return;
+  }
+  if (deferral.observed_count == deferral.observed_aggregates.size()) {
+    // The test seam is bounded by the same owner capacity as one CUDA batch. Refuse to release the
+    // gate rather than silently treating a duplicate or unrepresentable owner as distinct.
+    return;
+  }
+  deferral.observed_aggregates[deferral.observed_count++] = aggregate;
+  --deferral.remaining_logical_preads;
+  if (deferral.remaining_logical_preads == 0) {
+    deferral.observed_aggregates.fill(nullptr);
+    deferral.observed_count = 0;
+  }
+}
+
+[[nodiscard]] bool direct_receive_submission_is_deferred() noexcept
+{
+  auto& deferral = direct_receive_submission_deferral;
+  std::lock_guard lock{deferral.mutex};
+  return deferral.remaining_logical_preads != 0;
+}
+#endif
 #endif
 
 void log_failure_noexcept(char const* prefix, std::exception_ptr failure) noexcept
@@ -168,6 +211,20 @@ void inject_multi_poll_reactor_construction_failure_after_for_testing(
 {
   reactor_construction_failure_countdown.store(successful_reactors, std::memory_order_relaxed);
 }
+
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+void defer_multi_poll_direct_receive_submission_until_for_testing(std::size_t logical_preads)
+{
+  KVIKIO_EXPECT(logical_preads <= direct_receive_max_slots_per_cuda_batch,
+                "direct-receive submission deferral exceeds one batch's owner capacity",
+                std::invalid_argument);
+  auto& deferral = direct_receive_submission_deferral;
+  std::lock_guard lock{deferral.mutex};
+  deferral.remaining_logical_preads = logical_preads;
+  deferral.observed_count           = 0;
+  deferral.observed_aggregates.fill(nullptr);
+}
+#endif
 #endif
 
 CurlMultiAttachment::CurlMultiAttachment(CURLM* multi, CURL* easy) noexcept
@@ -600,7 +657,6 @@ void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer
   auto released = state.callbacks->take_released_slot();
   auto const path =
     state.strict_attempt ? DirectReceiveCudaPath::strict_rx : DirectReceiveCudaPath::copied_stream;
-  auto* const aggregate = transfer.aggregate.get();
 
   while (true) {
     auto work = std::find_if(_direct_receive_cuda_work.begin(),
@@ -610,7 +666,7 @@ void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer
                                       !candidate.batch->submitted() &&
                                       !candidate.batch->completed() && !candidate.batch->failed() &&
                                       candidate.cuda_context == transfer.device_ctx &&
-                                      candidate.path == path && candidate.aggregate == aggregate;
+                                      candidate.path == path;
                              });
     if (work == _direct_receive_cuda_work.end()) {
       PushAndPopContext current{transfer.device_ctx};
@@ -619,7 +675,6 @@ void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer
       fresh.cuda_context = transfer.device_ctx;
       fresh.stream       = stream;
       fresh.path         = path;
-      fresh.aggregate    = aggregate;
       fresh.batch = std::make_unique<DirectReceiveCudaBatch>(transfer.device_ctx, stream, path);
       _direct_receive_cuda_work.push_back(std::move(fresh));
       work = std::prev(_direct_receive_cuda_work.end());
@@ -632,7 +687,11 @@ void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer
                                             transfer.ctx.size,
                                             transfer.aggregate->io_event_barrier,
                                             owner_index);
-    if (added == DirectReceiveCudaAddResult::batch_full) {
+    if (added == DirectReceiveCudaAddResult::batch_full ||
+        added == DirectReceiveCudaAddResult::batch_incompatible) {
+      KVIKIO_EXPECT(!work->batch->empty(),
+                    "empty direct-receive CUDA batch rejected valid work",
+                    std::logic_error);
       submit_direct_receive_batch(*work);
       continue;
     }
@@ -645,6 +704,11 @@ void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer
     work->owners[owner_index] = &transfer;
     ++work->owner_count;
     ++state.consumer_slots_outstanding;
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+    // Header/framing-only releases do not contribute an H2D descriptor. Do not let one open the
+    // test gate before this logical pread's body-bearing work has joined the collecting batch.
+    if (released.body_bytes != 0) { observe_deferred_direct_receive_aggregate(transfer.aggregate); }
+#endif
     if (state.callbacks->body_complete()) {
       clear_direct_receive_waiting(state);
     } else {
@@ -656,6 +720,9 @@ void MultiPollReactor::collect_direct_receive_slot(RemoteMultiTransfer& transfer
 
 void MultiPollReactor::submit_collecting_direct_receive_batches()
 {
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+  if (direct_receive_submission_is_deferred()) { return; }
+#endif
   for (auto& work : _direct_receive_cuda_work) {
     if (work.submission_failure == nullptr && !work.batch->submitted() &&
         !work.batch->completed() && !work.batch->failed()) {

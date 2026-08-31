@@ -34,9 +34,10 @@ inline constexpr std::size_t direct_receive_max_slots_per_cuda_batch =
 enum class DirectReceiveCudaAddResult : std::uint8_t {
   added,
   batch_full,
+  batch_incompatible,
 };
 
-/** @brief Receive path whose logical H2D batch this object accounts for. */
+/** @brief Receive path whose KvikIO H2D batch submission this object accounts for. */
 enum class DirectReceiveCudaPath : std::uint8_t {
   strict_rx,
   copied_stream,
@@ -57,6 +58,10 @@ struct DirectReceiveCudaSubmission {
  * that CUDA no longer reads them. Multiple logical reads may share one CUDA batch only when
  * every destination range is provably disjoint and every completion barrier belongs to the same
  * CUDA context.
+ *
+ * One KvikIO batch submission may contain work from independent logical reads. CUDA cannot
+ * identify which descriptor caused a submission or completion failure, so such a failure is
+ * deliberately reported to every logical owner represented in that batch.
  *
  * All validation happens before slot ownership changes. All completion events and barrier state
  * are prepared before the first H2D call. Once submission begins, an error synchronizes the stream
@@ -89,8 +94,11 @@ class KVIKIO_EXPORT DirectReceiveCudaBatch {
    * completion path must retain an independent owner until every terminal cookie has been reported
    * and it has synchronized the barrier, including after a failed local stream fence.
    * @param completion_cookie Opaque value returned after this slot's H2D completes.
-   * @return `added`, or `batch_full` without changing any argument or batch state.
-   * @throws std::invalid_argument for malformed, out-of-range, overlapping, or wrong-context work.
+   * @return `added`; `batch_full` when a fixed capacity was reached; or `batch_incompatible` when
+   * the work is valid by itself but overlaps a destination owned by a different logical read in
+   * this batch. Neither non-added result changes any argument or batch state.
+   * @throws std::invalid_argument for malformed, same-logical-read overlapping, internally
+   * overlapping, out-of-range, or wrong-context work.
    * @throws std::logic_error unless the batch is still collecting work.
    */
   [[nodiscard]] DirectReceiveCudaAddResult try_add(DirectReceiveSlotPool::Slot& slot,
@@ -155,6 +163,11 @@ class KVIKIO_EXPORT DirectReceiveCudaBatch {
    * @brief Make the next submission fail before allocating or enqueueing CUDA work.
    */
   static void inject_pre_submit_allocation_failure_for_testing() noexcept;
+
+  /**
+   * @brief Make the next submission fail after its H2D batch has been enqueued.
+   */
+  static void inject_post_enqueue_failure_for_testing() noexcept;
 #endif
 
  private:
@@ -186,6 +199,7 @@ class KVIKIO_EXPORT DirectReceiveCudaBatch {
   std::array<CUdeviceptr, direct_receive_max_copies_per_cuda_batch> _destinations{};
   std::array<CUdeviceptr, direct_receive_max_copies_per_cuda_batch> _sources{};
   std::array<std::size_t, direct_receive_max_copies_per_cuda_batch> _sizes{};
+  std::array<IoEventBarrier*, direct_receive_max_copies_per_cuda_batch> _copy_barriers{};
   std::array<std::shared_ptr<IoEventBarrier>, direct_receive_max_slots_per_cuda_batch> _barriers{};
   std::optional<CudaEventPool::CudaEvent> _completion_event;
 };

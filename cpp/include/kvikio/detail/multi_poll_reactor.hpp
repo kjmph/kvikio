@@ -281,6 +281,20 @@ void inject_multi_poll_admission_failure_after_for_testing(
  */
 void inject_multi_poll_reactor_construction_failure_after_for_testing(
   std::size_t successful_reactors) noexcept;
+
+#if defined(CURL_HAS_RECV_BUFFER_CALLBACKS) && defined(CURL_HAS_KTLS_DIRECT_RX)
+/**
+ * @brief Defer ordinary collecting-batch submission until this many logical preads contribute.
+ *
+ * Each distinct aggregate owner is counted once when it contributes body-bearing H2D work; its
+ * header/framing-only slots do not open the gate. Capacity and destination-overlap boundaries
+ * still submit immediately. This deterministic test seam resets itself when the requested number
+ * of logical preads has been observed.
+ *
+ * @throws std::invalid_argument if `logical_preads` exceeds one CUDA batch's owner capacity.
+ */
+void defer_multi_poll_direct_receive_submission_until_for_testing(std::size_t logical_preads);
+#endif
 #endif
 
 /**
@@ -389,7 +403,8 @@ class MultiPollReactor {
     CUcontext cuda_context{};
     CUstream stream{};
     DirectReceiveCudaPath path{DirectReceiveCudaPath::strict_rx};
-    RemoteMultiAggregateContext* aggregate{};
+    // Owner cookies and per-pread barriers in DirectReceiveCudaBatch keep completion independent;
+    // one reactor/context/path batch may therefore combine slots from multiple logical preads.
     std::unique_ptr<DirectReceiveCudaBatch> batch;
     std::exception_ptr submission_failure;
     std::array<RemoteMultiTransfer*, direct_receive_max_slots_per_cuda_batch> owners{};

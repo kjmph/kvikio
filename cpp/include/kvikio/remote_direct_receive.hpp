@@ -44,8 +44,11 @@ struct RemoteDirectReceiveStats {
   std::uint64_t pinned_slots_acquired{};
   std::uint64_t pinned_slot_exhaustions{};
 
-  // Receive totals include only successful final attempts. H2D totals include successful
-  // submission calls whose containing transfer may subsequently retry or fail.
+  // Receive totals include only successful final attempts. H2D totals include successful KvikIO
+  // batch submission calls whose containing transfers may subsequently retry or fail. One H2D
+  // batch may combine slots from multiple logical preads on the same reactor, CUDA context, and
+  // receive path. On CUDA versions without a native batch API, one such batch uses multiple async
+  // copy calls on one stream.
   std::uint64_t strict_rx_raw_received_bytes{};
   std::uint64_t strict_rx_body_bytes{};
   std::uint64_t strict_rx_h2d_bytes{};

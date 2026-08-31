@@ -21,6 +21,7 @@ namespace {
 
 #if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
 std::atomic<bool> fail_next_pre_submit_allocation{false};
+std::atomic<bool> fail_next_post_enqueue{false};
 #endif
 
 [[nodiscard]] bool ranges_overlap(CUdeviceptr lhs,
@@ -145,12 +146,6 @@ DirectReceiveCudaAddResult DirectReceiveCudaBatch::try_add(
     static_cast<void>(checked_pointer_add(
       destination, span.size, "direct-receive destination end address overflow"));
 
-    for (std::size_t existing = 0; existing < _copy_count; ++existing) {
-      KVIKIO_EXPECT(
-        !ranges_overlap(destination, span.size, _destinations[existing], _sizes[existing]),
-        "direct-receive CUDA batch contains overlapping destinations",
-        std::invalid_argument);
-    }
     for (std::size_t prior = 0; prior < i; ++prior) {
       auto const& prior_span = released.spans[prior];
       auto const prior_destination =
@@ -173,6 +168,27 @@ DirectReceiveCudaAddResult DirectReceiveCudaBatch::try_add(
                 "direct-receive CUDA batch byte count overflow",
                 std::invalid_argument);
 
+  // Validate the complete released descriptor before comparing it with previously accepted work.
+  // Independent preads may each be well-formed in isolation yet overlap one another's destination.
+  // They cannot share one unordered H2D batch, but the new descriptor itself is not malformed. Let
+  // the reactor submit this batch and retry the new slot in a fresh one instead of turning the
+  // incompatibility into a reactor-fatal validation error.
+  bool overlaps_another_logical_read{};
+  for (std::size_t i = 0; i < released.span_count; ++i) {
+    auto const& span       = released.spans[i];
+    auto const destination = checked_pointer_add(
+      destination_base, span.destination_offset, "direct-receive destination address overflow");
+    for (std::size_t existing = 0; existing < _copy_count; ++existing) {
+      if (ranges_overlap(destination, span.size, _destinations[existing], _sizes[existing])) {
+        KVIKIO_EXPECT(_copy_barriers[existing] != barrier.get(),
+                      "one logical direct-receive read contains overlapping destinations",
+                      std::invalid_argument);
+        overlaps_another_logical_read = true;
+      }
+    }
+  }
+  if (overlaps_another_logical_read) { return DirectReceiveCudaAddResult::batch_incompatible; }
+
   bool barrier_already_present{};
   for (std::size_t i = 0; i < _barrier_count; ++i) {
     if (_barriers[i].get() == barrier.get()) {
@@ -187,11 +203,12 @@ DirectReceiveCudaAddResult DirectReceiveCudaBatch::try_add(
   // Every validation and capacity check is complete. Flatten only live spans, then take ownership
   // of the slot as the final non-throwing mutation.
   for (std::size_t i = 0; i < released.span_count; ++i) {
-    auto const& span          = released.spans[i];
-    auto const descriptor     = _copy_count + i;
-    _sources[descriptor]      = source_base + span.source_offset;
-    _destinations[descriptor] = destination_base + span.destination_offset;
-    _sizes[descriptor]        = span.size;
+    auto const& span           = released.spans[i];
+    auto const descriptor      = _copy_count + i;
+    _sources[descriptor]       = source_base + span.source_offset;
+    _destinations[descriptor]  = destination_base + span.destination_offset;
+    _sizes[descriptor]         = span.size;
+    _copy_barriers[descriptor] = barrier.get();
   }
   if (!barrier_already_present) { _barriers[_barrier_count++] = std::move(barrier); }
   _cookies[_slot_count] = completion_cookie;
@@ -248,6 +265,11 @@ DirectReceiveCudaSubmission DirectReceiveCudaBatch::submit()
     } else {
       direct_receive_record_copied_h2d_submission(_body_bytes);
     }
+#if defined(KVIKIO_ENABLE_TEST_FAILURE_INJECTION)
+    if (fail_next_post_enqueue.exchange(false, std::memory_order_relaxed)) {
+      throw std::runtime_error{"injected post-enqueue direct-receive CUDA failure"};
+    }
+#endif
     for (std::size_t i = 0; i < _barrier_count; ++i) {
       _barriers[i]->record_prepared_event(_stream);
     }
@@ -442,6 +464,11 @@ void DirectReceiveCudaBatch::clear_metadata() noexcept
 void DirectReceiveCudaBatch::inject_pre_submit_allocation_failure_for_testing() noexcept
 {
   fail_next_pre_submit_allocation.store(true, std::memory_order_relaxed);
+}
+
+void DirectReceiveCudaBatch::inject_post_enqueue_failure_for_testing() noexcept
+{
+  fail_next_post_enqueue.store(true, std::memory_order_relaxed);
 }
 #endif
 

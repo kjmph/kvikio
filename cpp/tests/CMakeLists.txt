@@ -182,6 +182,10 @@ if(KvikIO_REMOTE_SUPPORT)
   kvikio_add_test(NAME URL_TEST SOURCES test_url.cpp)
   kvikio_add_test(NAME MULTI_POLL_REACTOR_TEST SOURCES test_multi_poll_reactor.cpp utils/env.cpp)
   kvikio_add_test(
+    NAME MULTI_POLL_DIRECT_RECEIVE_BATCH_TEST SOURCES test_multi_poll_direct_receive_batch.cpp
+  )
+  set_tests_properties(MULTI_POLL_DIRECT_RECEIVE_BATCH_TEST PROPERTIES TIMEOUT 30)
+  kvikio_add_test(
     NAME MULTI_POLL_SUBMISSION_FAILURE_TEST SOURCES test_multi_poll_submission_failure.cpp
   )
   kvikio_add_test(
