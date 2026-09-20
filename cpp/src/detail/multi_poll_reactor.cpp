@@ -972,6 +972,14 @@ void MultiPollReactor::finish_direct_receive_transfers(
         continue;
       }
 
+      if (transfer->curl->retry_without_mss_filter(state.network_result)) {
+        // No request reached a peer. Preserve strict direct receive and object validation;
+        // only connection selection falls back, after all consumer slots have drained.
+        auto const strict = state.strict_attempt;
+        requeue_direct_receive(std::move(transfer), strict, std::chrono::steady_clock::now());
+        continue;
+      }
+
       if (state.strict_attempt && state.fallback_allowed &&
           direct_receive_can_fallback(
             false, state.network_result, direct_status, state.callbacks->body_bytes())) {
@@ -1313,6 +1321,10 @@ void MultiPollReactor::io_thread_main()
 
         std::exception_ptr transfer_err;
         try {
+          if (transfer->curl->retry_without_mss_filter(res)) {
+            requeue_for_retry(std::move(transfer), std::chrono::steady_clock::now());
+            continue;
+          }
           if (res == CURLE_OK && !transfer->ctx.overflow_error) {
             if (transfer->is_device) {
               // Phase A (network -> pinned) done. Now schedule Phase B (pinned -> device) on this

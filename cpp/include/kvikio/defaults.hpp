@@ -148,6 +148,7 @@ class defaults {
   unsigned int _remote_io_num_reactors;
   RemoteReactorDispatch _remote_io_reactor_dispatch;
   std::size_t _remote_io_max_concurrent_requests;
+  bool _remote_adaptive_tcp_mss;
   RemoteDirectReceiveMode _remote_direct_receive_mode;
   std::size_t _remote_direct_receive_slot_size;
   std::size_t _remote_direct_receive_max_pinned_bytes;
@@ -542,6 +543,16 @@ class defaults {
    * @return The configured concurrent-request ceiling, or 0 for unlimited.
    */
   [[nodiscard]] static std::size_t remote_io_max_concurrent_requests();
+
+  /**
+   * @brief Opt-in adaptive reuse of jumbo-capable HTTP/1.1 connections.
+   *
+   * Controlled by `KVIKIO_REMOTE_ADAPTIVE_TCP_MSS` (default false). Requires Linux and the
+   * experimental libcurl connection-reuse callback. Applies to both remote I/O backends.
+   * Observes completed GET bodies, with bounded retirement and expiring evidence. Does not alter
+   * DNS, MTU, request size, or successful-read retry behavior. Proxies and HTTP/2/3 are bypassed.
+   */
+  [[nodiscard]] static bool remote_adaptive_tcp_mss();
 
   /**
    * @brief Policy for the experimental caller-owned kTLS receive path.

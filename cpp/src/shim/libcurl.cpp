@@ -17,6 +17,7 @@
 #include <curl/curl.h>
 
 #include <kvikio/defaults.hpp>
+#include <kvikio/detail/adaptive_tcp_mss.hpp>
 #include <kvikio/detail/http_retry.hpp>
 #include <kvikio/detail/parallel_operation.hpp>
 #include <kvikio/detail/posix_io.hpp>
@@ -123,10 +124,15 @@ CurlHandle::CurlHandle(LibCurl::UniqueHandlePtr handle,
   if (verbose) { setopt(CURLOPT_VERBOSE, 1L); }
 
   detail::set_up_ca_paths(*this);
+  if (defaults::remote_adaptive_tcp_mss()) {
+    _adaptive_tcp_mss = std::make_unique<detail::AdaptiveTcpMssConnection>(this->handle());
+  }
 }
 
 CurlHandle::~CurlHandle() noexcept
 {
+  // Detach borrowed callback state before the easy handle enters the reuse pool.
+  _adaptive_tcp_mss.reset();
   if (_handle) {
     // A retained easy handle is reset before reuse, but clear its borrowed
     // header pointer before releasing the list to make that lifetime explicit.
@@ -146,6 +152,11 @@ std::string CurlHandle::error_message() const
 }
 
 void CurlHandle::clear_error_message() noexcept { _errbuf[0] = 0; }
+
+bool CurlHandle::retry_without_mss_filter(CURLcode result) noexcept
+{
+  return _adaptive_tcp_mss && _adaptive_tcp_mss->retry_unfiltered(result);
+}
 
 void CurlHandle::append_http_header(std::string const& header)
 {
@@ -168,6 +179,11 @@ void CurlHandle::perform(std::function<void()> const& on_retry)
   for (std::size_t attempt = 1;; ++attempt) {
     clear_error_message();
     auto const curl_code = curl_easy_perform(handle());
+    if (retry_without_mss_filter(curl_code)) {
+      // No HTTP request was sent. Keep the ordinary retry budget and callback state intact.
+      --attempt;
+      continue;
+    }
 
     long http_code = 0;
     // We had an error. Is it retryable?

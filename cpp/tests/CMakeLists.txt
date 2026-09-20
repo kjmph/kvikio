@@ -175,6 +175,19 @@ if(KvikIO_REMOTE_SUPPORT)
   kvikio_add_test(NAME DIRECT_RECEIVE_CUDA_TEST SOURCES test_direct_receive_cuda.cpp)
   kvikio_add_test(NAME DIRECT_RECEIVE_SLOT_POOL_TEST SOURCES test_direct_receive_slot_pool.cpp)
   kvikio_add_test(NAME HTTP_RETRY_TEST SOURCES test_http_retry.cpp utils/env.cpp)
+  kvikio_add_test(NAME ADAPTIVE_TCP_MSS_TEST SOURCES test_adaptive_tcp_mss.cpp)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    kvikio_add_test(
+      NAME ADAPTIVE_TCP_MSS_INTEGRATION_TEST
+      SOURCES test_adaptive_tcp_mss_integration.cpp utils/env.cpp
+    )
+    set_tests_properties(
+      ADAPTIVE_TCP_MSS_INTEGRATION_TEST
+      PROPERTIES ENVIRONMENT
+                 "KVIKIO_REMOTE_ADAPTIVE_TCP_MSS=ON;KVIKIO_REMOTE_IO_NUM_REACTORS=1;KVIKIO_REMOTE_DIRECT_RECEIVE=OFF"
+                 TIMEOUT 60
+    )
+  endif()
   kvikio_add_test(NAME DIRECT_RECEIVE_TEST SOURCES test_direct_receive.cpp)
   kvikio_add_test(NAME REMOTE_HANDLE_TEST SOURCES test_remote_handle.cpp utils/env.cpp)
   kvikio_add_test(NAME HDFS_TEST SOURCES test_hdfs.cpp utils/hdfs_helper.cpp)

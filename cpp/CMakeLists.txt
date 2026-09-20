@@ -197,6 +197,7 @@ if(KvikIO_REMOTE_SUPPORT)
     "src/aws_credential_provider.cpp"
     "src/hdfs.cpp"
     "src/remote_handle.cpp"
+    "src/detail/adaptive_tcp_mss.cpp"
     "src/detail/direct_receive.cpp"
     "src/detail/direct_receive_cuda.cpp"
     "src/detail/direct_receive_slot_pool.cpp"

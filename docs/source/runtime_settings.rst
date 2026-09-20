@@ -1,6 +1,58 @@
 Runtime Settings
 ================
 
+Adaptive TCP MSS ``KVIKIO_REMOTE_ADAPTIVE_TCP_MSS``
+--------------------------------------------------
+
+Experimental and disabled by default. Set this boolean before starting remote I/O.
+Both ``EASY_THREADPOOL`` and ``MULTI_POLL`` use the same process-wide policy.
+Enabling it requires Linux and the experimental libcurl
+``CURLOPT_CONN_REUSEFUNCTION`` API; unsupported builds reject opt-in explicitly.
+The loaded libcurl must also identify the expected callback option by name,
+number and type; patched headers alone do not establish runtime support.
+
+After a successful HTTP/1.1 GET of at least 64 KiB, KvikIO samples ``TCP_INFO``.
+An observed path MTU and receive MSS both at least 8000 bytes establish jumbo
+evidence for that origin (scheme, host, port), local address and address family.
+Only after that evidence may a connection with either value at most 2048 bytes
+be retired from curl's connection cache. Intermediate values, unknown samples,
+small responses, HEAD requests, proxies and HTTP/2 or HTTP/3 retain normal reuse.
+
+Evidence expires after 60 seconds. Each evidence window permits at most 24
+retirements, shared across all reactors; intervening jumbo samples do not reset
+the budget. Exhausted or expired evidence falls back to normal connection reuse.
+At most 128 origins/address combinations are retained, without evicting live
+budgets. This bounds connection churn and state, including on ordinary-MTU paths.
+
+Retired peer addresses become expiring connection preferences for the same
+origin and address family. When opening a new socket, KvikIO asks curl to skip
+these candidates and try the next address in its existing resolver result.
+Neither DNS answers nor their cache are modified. Peer hints are not used when
+multiple local paths have live jumbo evidence for the origin/family. The local path
+of a new connection is not yet known: these are preferences, not universal
+claims about an IP address's MTU. A later jumbo response removes that peer's hint.
+
+If filtered connection establishment fails before any HTTP request was sent,
+one unfiltered attempt is allowed without consuming an HTTP retry. Filtering
+and retirement for that origin are then suspended for the remainder of the
+evidence window, allowing a working small-MSS connection to be reused. No
+extra attempt is made for an HTTP error or partial response. An endpoint with
+only small-MSS peers therefore continues to work, even after stale jumbo
+evidence; an actually unreachable endpoint still fails through normal error
+handling. Existing in-flight requests finish normally.
+
+Retirement happens only after delivering the successful response and never
+replays that response. The policy changes neither request size, MTU, TCP buffer
+settings, TLS verification nor credentials. It cannot discover
+a jumbo route unless normal traffic actually encounters one. MSS is a heuristic,
+not a bandwidth measurement; benchmark before enabling this in production.
+
+``KVIKIO_LOG_LEVEL=DEBUG`` logs retirement decisions without object URLs or
+credentials. C++ diagnostics can inspect
+``kvikio::detail::adaptive_tcp_mss_policy().stats()`` for process-wide jumbo,
+unproven, retired, fallback, intermediate and unobservable counts. These are
+diagnostics, not per-query byte or throughput counters.
+
 Compatibility Mode ``KVIKIO_COMPAT_MODE``
 -----------------------------------------
 When KvikIO is running in compatibility mode, it doesn't load ``libcufile.so``. Instead, reads and writes are done using POSIX. Notice, this is not the same as the compatibility mode in cuFile. It is possible that KvikIO performs I/O in the non-compatibility mode by using the cuFile library, but the cuFile library itself is configured to operate in its own compatibility mode. For more details, refer to `cuFile compatibility mode <https://docs.nvidia.com/gpudirect-storage/api-reference-guide/index.html#cufile-compatibility-mode>`_ and `cuFile environment variables <https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/index.html#environment-variables>`_ .

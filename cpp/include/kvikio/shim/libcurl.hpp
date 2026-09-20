@@ -21,6 +21,9 @@
 #include <kvikio/error.hpp>
 
 namespace kvikio {
+namespace detail {
+class AdaptiveTcpMssConnection;
+}
 
 /**
  * @brief Singleton class to initialize and cleanup the global state of libcurl
@@ -83,6 +86,7 @@ class CurlHandle {
   char _errbuf[CURL_ERROR_SIZE];
   LibCurl::UniqueHandlePtr _handle;
   curl_slist* _http_headers{};
+  std::unique_ptr<detail::AdaptiveTcpMssConnection> _adaptive_tcp_mss;
 
  public:
   /**
@@ -125,6 +129,10 @@ class CurlHandle {
    * @brief Discard the recorded error message.
    */
   void clear_error_message() noexcept;
+
+  // One fail-open attempt after MSS filtering exhausts pre-HTTP connection candidates.
+  // Does not consume an HTTP retry or relax TLS/response validation.
+  bool retry_without_mss_filter(CURLcode result) noexcept;
 
   /**
    * @brief Append one request header and retain its storage for this handle.

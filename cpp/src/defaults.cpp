@@ -208,6 +208,7 @@ defaults::defaults()
   }
 
   // Determine and configure the remote-IO backend.
+  _remote_adaptive_tcp_mss = getenv_or("KVIKIO_REMOTE_ADAPTIVE_TCP_MSS", false);
   {
     _remote_io_backend = getenv_or("KVIKIO_REMOTE_IO_BACKEND", RemoteIOBackend::EASY_THREADPOOL);
   }
@@ -364,6 +365,8 @@ void defaults::set_thread_pool_per_block_device(bool flag)
 }
 
 RemoteIOBackend defaults::remote_io_backend() { return instance()->_remote_io_backend; }
+
+bool defaults::remote_adaptive_tcp_mss() { return instance()->_remote_adaptive_tcp_mss; }
 
 void defaults::set_remote_io_backend(RemoteIOBackend backend)
 {
