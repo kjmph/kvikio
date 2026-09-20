@@ -19,7 +19,7 @@ function(find_and_configure_libcurl)
     GLOBAL_TARGETS libcurl
     CPM_ARGS
     GIT_REPOSITORY https://github.com/kjmph/curl.git
-    GIT_TAG f6d53a27b7d80fa4087709243d4d425b3405c941
+    GIT_TAG 1c7a9684406103c9ab226ad7671f46322799653f
     OPTIONS "BUILD_CURL_EXE OFF" "BUILD_SHARED_LIBS OFF" "BUILD_TESTING OFF" "CURL_USE_LIBPSL OFF"
             "CURL_DISABLE_LDAP ON" "CMAKE_POSITION_INDEPENDENT_CODE ON"
     EXCLUDE_FROM_ALL YES # Don't install libcurl.a (only needed when building libkvikio.so)
